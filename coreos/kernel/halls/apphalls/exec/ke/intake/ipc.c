@@ -1,0 +1,1132 @@
+// ipc.c
+// System message support.
+// Messages using the circular queue into the thread structure.
+// Created by Fred Nora.
+
+// post = synchronous
+// send = asynchronous
+
+/*
+Summary
+Low-level workers: 
+  ipc_post_message_to_tid, 
+  ipc_post_message_to_tid2
+Wrappers for destinations: 
+  ipc_post_message_to_foreground_thread, 
+  ipc_post_message_to_init, 
+  ipc_post_message_to_ds
+Specialized input dispatcher: 
+  ipc_post_input_event_to_ds
+Broadcast dispatcher: 
+  ipc_broadcast_system_message
+*/
+
+#include <kernel.h>
+
+// #todo
+// #test
+// Tracking the last message.
+// This way we can change it in the case of repetitions.
+//struct msg_d *last_msg;
+
+int
+ipc_post_message_to_tid2 ( 
+    tid_t sender_tid,
+    tid_t receiver_tid,
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2,
+    unsigned long long3,
+    unsigned long long4 )
+{
+// #todo:
+// Nao podemos deixar que toda vez que uma thread receber uma mensagem 
+// ela exija um timeout. Pois uma aplicaçao pode enviar mensagens em loop.
+// Talvez isso deva ser permitido somente para mensagens de input vindas
+// dos device drivers.
+
+// Target thread.
+    struct thread_d *t;
+    struct msg_d *m;
+    int MessageCode=0;
+
+// TIDs
+    tid_t src_tid = (tid_t) (sender_tid & 0xFFFF);
+    tid_t dst_tid = (tid_t) (receiver_tid & 0xFFFF);
+
+// Message code
+    MessageCode = (int) (msg & 0xFFFFFFFF);
+    if (MessageCode<0){
+        goto fail;
+    }
+
+// tid
+    if ( dst_tid < 0 || 
+         dst_tid >= THREAD_COUNT_MAX )
+    {
+        panic("ipc_post_message_to_tid2: dst_tid\n");
+        //goto fail;
+    }
+
+// structure
+    t = (struct thread_d *) threadList[dst_tid];
+    if ((void *) t == NULL){
+        panic ("ipc_post_message_to_tid2: t\n");
+    }
+    if ( t->used != TRUE || t->magic != 1234 ){
+        panic ("ipc_post_message_to_tid2: t validation\n");
+    }
+    if (t->tid != dst_tid){
+        panic("ipc_post_message_to_tid2: t->tid != dst_tid\n");
+    }
+
+
+// Wakeup target thread
+    thread_wait_reason_t Reason = t->wait_reason;
+
+    if (t->state == WAITING || t->state == BLOCKED)
+    {
+        // Check the reasons
+        switch (Reason)
+        {
+            case WAIT_REASON_YIELD:
+            case WAIT_REASON_PREEMPTED:
+            case WAIT_REASON_PRIORITY_BOOST:
+            case WAIT_REASON_BLOCKED:  // Generic
+            case WAIT_REASON_LOOP:     // Empty msg queue
+                printk("ipc: Unblocking ...\n");
+                do_thread_ready(dst_tid);
+                break;
+        };        
+    }
+
+//
+// This thread needs a timeout.
+//
+
+// Let's tell to ts.c that this thread needs a timeout.
+// So this way the ts ca break the round and give to this thread
+// the opportunity to run immediately.
+// #bugbug
+// A malicious process could send a lot of messages
+// causing starvation in the other threads?
+
+    if (g_use_event_responder == TRUE)
+    {
+        t->has_pending_event = TRUE;
+        t->quantum = QUANTUM_MAX;
+        t->priority = PRIORITY_MAX;
+        t->state = READY;
+
+        //ev_responder_thread = (struct thread_d *) t;
+        set_ev_responder(t);
+    }
+
+//
+// The message
+//
+
+// Vamos colocar essa mensagem na outra fila de mensagens.
+// Essa nova fila sera a única fila no futuro.
+
+// Get the pointer for the next entry.
+    m = (struct msg_d *) t->MsgQueue[ t->MsgQueueTail ];
+    if ((void*) m == NULL){
+        panic ("ipc_post_message_to_tid2: m\n");
+    }
+    if ( m->used != TRUE || m->magic != 1234 ){
+        panic ("ipc_post_message_to_tid2: m validation\n");
+    }
+
+// Standard header
+    m->opaque_window = NULL;
+    m->msg   = (int) (MessageCode & 0xFFFFFFFF);
+    m->long1 = (unsigned long) long1;
+    m->long2 = (unsigned long) long2;
+
+// Extras payload
+    m->long3 = (unsigned long) long3;
+    m->long4 = (unsigned long) long4;
+
+// -------------------------
+// Identification field
+    m->sender_tid   = (tid_t) src_tid; 
+    m->receiver_tid = (tid_t) dst_tid;
+    //m->sender_pid = ?;
+    //m->receiver_pid = ?;
+
+// -------------------------
+    m->next = NULL;
+
+// Done
+    t->MsgQueueTail++;
+    if (t->MsgQueueTail >= MSG_QUEUE_MAX){
+        t->MsgQueueTail = 0;
+    }
+
+    return 0;
+
+fail2:
+    if ((void*) t == NULL){
+        return (int) -1;
+    }
+    t->MsgQueueTail++;
+    if (t->MsgQueueTail >= MSG_QUEUE_MAX){
+        t->MsgQueueTail = 0;
+    }
+fail:
+    return (int) -1;
+}
+
+// ipc_post_message_to_tid:
+// #bugbug
+// long1 and long2 will mask to single byte.
+// IN: tid, window, message code, ascii code, raw byte.
+// Post message.
+// Async
+// Starvation risk: If malicious or buggy code keeps sending invalid messages, 
+// threads may repeatedly hit this path and block unnecessarily.
+int
+ipc_post_message_to_tid ( 
+    tid_t sender_tid,
+    tid_t receiver_tid,
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+// #todo:
+// Nao podemos deixar que toda vez que uma thread receber uma mensagem 
+// ela exija um timeout. Pois uma aplicaçao pode enviar mensagens em loop.
+// Talvez isso deva ser permitido somente para mensagens de input vindas
+// dos device drivers.
+
+// Target thread
+    struct thread_d *t;
+    struct msg_d *m;
+    int MessageCode=0;
+
+// TIDs
+    tid_t src_tid = (tid_t) (sender_tid & 0xFFFF);
+    tid_t dst_tid = (tid_t) (receiver_tid & 0xFFFF);
+
+// Message code
+    MessageCode = (int) (msg & 0xFFFFFFFF);
+    if (MessageCode <= 0){
+        goto fail;
+    }
+
+// Destination TID
+    if ( dst_tid < 0 || dst_tid >= THREAD_COUNT_MAX )
+    {
+        panic("ipc_post_message_to_tid: dst_tid\n");
+        //goto fail;
+    }
+
+// structure
+    t = (struct thread_d *) threadList[dst_tid];
+    if ((void *) t == NULL){
+        panic ("ipc_post_message_to_tid: t\n");
+    }
+    if (t->used != TRUE || t->magic != 1234){
+        panic("ipc_post_message_to_tid: t validation\n");
+    }
+    if (t->tid != dst_tid){
+        panic("ipc_post_message_to_tid: t->tid != dst_tid\n");
+    }
+
+// Wakeup target thread
+    thread_wait_reason_t Reason = t->wait_reason;
+
+// Check the reasons
+    if (t->state == WAITING || t->state == BLOCKED)
+    {
+        switch (Reason)
+        {
+            case WAIT_REASON_YIELD:
+            case WAIT_REASON_PREEMPTED:
+            case WAIT_REASON_PRIORITY_BOOST:
+            case WAIT_REASON_BLOCKED:  // Generic
+            case WAIT_REASON_LOOP:     // Empty msg queue
+                // #debug
+                printk("ipc: Unblocking %d\n", dst_tid);
+                do_thread_ready(dst_tid);
+                break;
+        };        
+    }
+
+// #test
+// This thread needs a timeout.
+// Let's tell to ts.c that this thread needs a timeout.
+// So this way the ts can break the round and 
+// give to this thread the opportunity to run immediately.
+// #bugbug
+// A malicious process could send a lot of messages
+// causing starvation in the other threads?
+
+    if (g_use_event_responder == TRUE)
+    {
+        t->has_pending_event = TRUE;
+        t->quantum = QUANTUM_MAX;
+        t->priority = PRIORITY_MAX;
+        t->state = READY;
+
+        //ev_responder_thread = (struct thread_d *) t;
+        set_ev_responder(t);
+    }
+
+    if (MessageCode == MSG_MOUSEMOVE)
+    {
+        t->quantum = QUANTUM_MAX * 2;
+        t->state = READY;
+    }
+
+// ======================================================
+// Only coalesce for mouse move messages
+// Prevents queue flooding with excessive mouse move events.
+// Reduces input lag: The display server always receives the most recent mouse position.
+// Leaves more room in the queue for other important events (clicks, keypresses, etc).
+// Industry standard: This is the same approach used in major OSes and GUI toolkits.
+// Interpret the message as "the mouse is now at this position."
+
+    if (MessageCode == MSG_MOUSEMOVE) 
+    {
+        int last_index = (t->MsgQueueTail - 1 + MSG_QUEUE_MAX) % MSG_QUEUE_MAX;
+        struct msg_d *last_msg = t->MsgQueue[last_index];
+
+        if ((void*) last_msg == NULL){
+            panic ("ipc_post_message_to_tid: last_msg\n");
+        }
+        if ( last_msg->used != TRUE || last_msg->magic != 1234 ){
+            panic ("ipc_post_message_to_tid: last_msg validation\n");
+        }
+
+        // Check if last message is also a mouse move
+        if ( last_msg->msg == MSG_MOUSEMOVE && 
+             last_msg->receiver_tid == (tid_t) dst_tid ) 
+        {
+            // Overwrite the last message with the new coordinates
+            last_msg->long1 = long1;
+            last_msg->long2 = long2;
+            // Optionally update timestamps or other fields
+            // Extra payload
+            last_msg->long3 = (unsigned long) jiffies;
+            last_msg->long4 = (unsigned long) jiffies;
+            // ...
+            last_msg->sender_tid   = (tid_t) src_tid; 
+            last_msg->receiver_tid = (tid_t) dst_tid;
+
+            return 0; // Do NOT advance MsgQueueTail, since we didn't add a new message
+        }
+    }
+// ======================================================
+
+// ======================================================
+// #todo:
+// We can implement a repeat counter for keydown when an user keep
+// a key pressed for a long time.
+// Interpret the message as "the key is currently held down, and has repeated N times."
+
+    int isMake = FALSE;
+    int isControlArrow = FALSE;
+
+    switch (MessageCode){
+
+    // Handle keydown (with repeat count logic)
+    case MSG_KEYDOWN:
+        isMake = TRUE;
+        break;
+
+    // Handle Control+Arrow key (with repeat count logic)
+    case MSG_CONTROL_ARROW_UP:
+    case MSG_CONTROL_ARROW_DOWN:
+    case MSG_CONTROL_ARROW_LEFT:
+    case MSG_CONTROL_ARROW_RIGHT:
+        isControlArrow = TRUE;
+        break;
+
+    // Other messages
+    default:
+        break;
+    };
+
+    if (isMake == TRUE || isControlArrow == TRUE)
+    {
+        int __last_index = (t->MsgQueueTail - 1 + MSG_QUEUE_MAX) % MSG_QUEUE_MAX;
+        struct msg_d *__last_msg = t->MsgQueue[__last_index];
+        if ((void*) __last_msg == NULL){
+            panic ("ipc_post_message_to_tid: __last_msg\n");
+        }
+        if ( __last_msg->used != TRUE || __last_msg->magic != 1234 ){
+            panic ("ipc_post_message_to_tid: __last_msg validation\n");
+        }
+
+        // Make:
+        // Now handle coalescing for both regular keys and control+arrow
+        if (isMake == TRUE && __last_msg->receiver_tid == (tid_t) dst_tid) 
+        {
+            if (__last_msg->msg == MSG_KEYDOWN && __last_msg->long1 == long1) 
+            {
+                __last_msg->long1 = long1;
+                __last_msg->long2 = long2;
+                __last_msg->long3 = (unsigned long) jiffies;
+                __last_msg->long4 += 1; // increment repeat count
+                __last_msg->sender_tid   = (tid_t) src_tid; 
+                __last_msg->receiver_tid = (tid_t) dst_tid;
+                return 0;
+            }
+        }
+        // Control arrow:
+        if (isControlArrow == TRUE && __last_msg->receiver_tid == (tid_t) dst_tid) 
+        {
+            if (__last_msg->msg == MessageCode) 
+            {
+                __last_msg->long3 = (unsigned long) jiffies;
+                __last_msg->long4 += 1; // increment repeat count
+                __last_msg->sender_tid   = (tid_t) src_tid; 
+                __last_msg->receiver_tid = (tid_t) dst_tid;
+                return 0;
+            }
+        }
+    }
+
+// ======================================================
+
+//
+// The message
+//
+
+// Vamos colocar essa mensagem na outra fila de mensagens.
+// Essa nova fila sera a única fila no futuro.
+
+// Get the pointer for the next entry
+    m = (struct msg_d *) t->MsgQueue[ t->MsgQueueTail ];
+    if ((void*) m == NULL){
+        panic ("ipc_post_message_to_tid: m\n");
+    }
+    if (m->used != TRUE || m->magic != 1234){
+        panic ("ipc_post_message_to_tid: m validation\n");
+    }
+
+// Standard header
+    m->opaque_window = NULL;
+    m->msg = (int) (MessageCode & 0xFFFFFFFF);
+    m->long1 = (unsigned long) long1;
+    m->long2 = (unsigned long) long2;
+
+// Extra payload
+    m->long3 = (unsigned long) jiffies;
+    m->long4 = (unsigned long) jiffies;
+
+// Identification field
+    m->sender_tid   = (tid_t) src_tid; 
+    m->receiver_tid = (tid_t) dst_tid;
+    //m->sender_pid = ?;
+    //m->receiver_pid = ?;
+
+// --------------------------
+    m->next = NULL;
+
+// Done
+    t->MsgQueueTail++;
+    if (t->MsgQueueTail >= MSG_QUEUE_MAX){
+        t->MsgQueueTail = 0;
+    }
+
+    return 0;
+
+fail2:
+    if ((void*) t == NULL){
+        return (int) -1;
+    }
+    t->MsgQueueTail++;
+    if (t->MsgQueueTail >= MSG_QUEUE_MAX){
+        t->MsgQueueTail = 0;
+    }
+fail:
+    return (int) -1;
+}
+
+// Post message to the foreground thread
+int
+ipc_post_message_to_foreground_thread ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+// Kernel is the sender and init process is the receiver
+    tid_t SenderTID = __HARDWARE_TID;
+    tid_t ReceiverTID = foreground_thread;
+
+    int RetValue=0;
+
+// Parameter:
+    if (msg < 0){
+        goto fail;
+    }
+
+// Target thread
+    if ( ReceiverTID < 0 || 
+         ReceiverTID >= THREAD_COUNT_MAX )
+    {
+        goto fail;
+    }
+ 
+    RetValue = 
+    (int) ipc_post_message_to_tid(
+            (tid_t) SenderTID, 
+            (tid_t) ReceiverTID,
+            (int) msg, 
+            (unsigned long) long1,
+            (unsigned long) long2 );
+
+    return (int) RetValue;
+
+fail:
+    return (int) -1;
+}
+
+// Post message from kernel to the init process
+int
+ipc_post_message_to_init ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+
+// Kernel is the sender and init thread is the receiver
+    tid_t SenderTID = __HARDWARE_TID;
+    tid_t ReceiverTID = INIT_TID;
+
+// Parameter:
+    if (msg < 0)
+        goto fail;
+
+// Is this a valid destination?
+    if ( ReceiverTID < 0 || 
+         ReceiverTID >= THREAD_COUNT_MAX )
+    {
+        goto fail;
+    }
+
+// Force unblocking
+    // do_thread_ready(ReceiverTID);
+
+// Post it
+    ipc_post_message_to_tid(
+        (tid_t) SenderTID, 
+        (tid_t) ReceiverTID,
+        (int) msg, 
+        (unsigned long) long1, 
+        (unsigned long) long2 );
+
+   return 0;
+
+fail:
+    return (int) -1;
+}
+
+// Post message to the first thread of the registered display server
+int
+ipc_post_message_to_ds ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+
+// Kernel is the sender and display server is the receiver
+    const tid_t SenderTID = (tid_t) __HARDWARE_TID;
+    tid_t ReceiverTID = -1;  // Not initialized yet
+
+// Parameter:
+    if (msg < 0)
+        goto fail;
+
+// Server is not running
+    if (DisplayServerInfo.initialized != TRUE){
+        goto fail;
+    }
+
+// Get the server's TID
+    ReceiverTID = (tid_t) DisplayServerInfo.tid;
+    if ( ReceiverTID < 0 || 
+         ReceiverTID >= THREAD_COUNT_MAX )
+    {
+        goto fail;
+    }
+
+// More credits to the receiver
+    do_credits_by_tid(ReceiverTID);
+    do_credits_by_tid(ReceiverTID);
+
+// Force unblocking
+// Wake up the server, it sleeps frequently
+    // wakeup_thread(ReceiverTID);
+    // do_thread_ready(ReceiverTID);
+
+// Post it
+    ipc_post_message_to_tid (
+        (tid_t) SenderTID, 
+        (tid_t) ReceiverTID,
+        (int) msg, 
+        (unsigned long) long1, 
+        (unsigned long) long2 );
+
+   return 0;
+
+fail:
+    return (int) -1;
+}
+
+// Wrapper for different types of input events.
+// Posting these events to the thread, 
+// not processing internally.
+int 
+ipc_post_input_event_to_ds( 
+    int event_id, 
+    long long1, 
+    long long2 )
+{
+    unsigned long button_number=0;
+
+// Parameter:
+    if (event_id < 0)
+        goto fail;
+
+    switch (event_id)
+    {
+        // Mouse
+        case MSG_MOUSEMOVE:
+            ipc_post_message_to_ds( event_id, long1, long2 );
+            return 0;
+            break;
+
+        case MSG_MOUSEPRESSED:
+        case MSG_MOUSERELEASED:
+            button_number = (unsigned long) (long1 & 0xFFFF);
+            ipc_post_message_to_ds( event_id, button_number, button_number );
+            break;
+
+        // Keyboard
+        case MSG_KEYDOWN:
+        case MSG_KEYUP:
+        case MSG_SYSKEYDOWN:
+        case MSG_SYSKEYUP:
+            ipc_post_message_to_ds( event_id, long1, long1 );
+            break;
+
+        // Timer
+        // Here we don't know about the frequency this worker is called.
+        // It's up to the caller.
+        case MSG_TIMER:
+            ipc_post_message_to_ds( MSG_TIMER, 1234, jiffies );   
+            break;
+
+        default:
+            goto fail;
+            break;
+    };
+
+fail:
+    return (int) -1;
+}
+
+// #todo
+// Broadcast system message to all the threads.
+// IN: Buffer
+unsigned long 
+ipc_broadcast_system_message(
+    tid_t sender_tid,
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2,
+    unsigned long long3,
+    unsigned long long4 )
+{
+    register int i=0;
+    struct thread_d *t;
+    int rv=0;
+    size_t Counter = 0;
+
+    tid_t src_tid = (tid_t) sender_tid;  // caller's tid.
+    tid_t dst_tid = (tid_t) -1;          // targt tid.
+
+// #todo
+
+    for (i=0; i<THREAD_COUNT_MAX; i++)
+    {
+        t = (struct threads_d *) threadList[i];
+        if ((void*) t != NULL)
+        {
+            if (t->magic == 1234)
+            {
+                dst_tid = (tid_t) t->tid;  // Receiver
+
+                // IN: sender,receiver,msg,l1,l2,l3,l4
+                rv = 
+                (int) ipc_post_message_to_tid2(
+                        src_tid,  // Sender 
+                        dst_tid,  // Receiver
+                        msg,
+                        long1, long2, long3, long4 );
+                
+                if (rv >= 0)
+                    Counter++;
+            }
+        }
+    };
+
+    unsigned long long_rv = (unsigned long) (Counter & 0xFFFFFFFF);
+
+// Return the number of posted messages
+    return (unsigned long) long_rv;
+}
+
+// Worker
+void *ipc_get_message(unsigned long ubuf)
+{
+    unsigned long *message_address = (unsigned long *) ubuf;
+    register struct thread_d *t;
+    register struct msg_d *m;
+    int fBlockOnEmpty = FALSE;
+    int fEmpty = FALSE;
+
+// buffer
+// #todo: Check some other invalid address.
+    if (ubuf == 0){
+        panic ("ipc_get_message: ubuf\n");
+        //return NULL;
+    }
+
+// ===========================================================
+// Thread
+// This is the thread that called this service.
+    if (current_thread < 0 || current_thread >= THREAD_COUNT_MAX){
+        return NULL;
+    }
+    t = (void *) threadList[current_thread];
+    if ((void *) t == NULL){
+        panic ("ipc_get_message: t\n");
+    }
+    if (t->used != TRUE || t->magic != 1234){
+        panic ("ipc_get_message: t validation\n");
+    }
+
+    // The thread wants to block on empty queue
+    if (t->msgctl.block_on_empty == TRUE)
+        fBlockOnEmpty = TRUE;
+
+// ===========================================================
+
+// Get the next head pointer
+    m = (struct msg_d *) t->MsgQueue[ t->MsgQueueHead ];
+    if ((void*) m == NULL){
+        goto fail0;
+    }
+    if (m->used != TRUE || m->magic != 1234){
+        goto fail0;
+    }
+
+// Invalid message code
+    if (m->msg <= 0)
+    {
+        t->msgctl.miss_count++;
+        fEmpty = TRUE;
+        goto fail;
+    }
+
+// --------------------------------
+// We got a valid message code
+
+    // Get standard header
+    message_address[0] = (unsigned long) m->opaque_window;
+    message_address[1] = (unsigned long) (m->msg & 0xFFFFFFFF);
+    message_address[2] = (unsigned long) m->long1;
+    message_address[3] = (unsigned long) m->long2;
+
+    /*
+    // #test
+    // If the display server is getting the
+    // mouse move events in it's own thread.
+    if (message_address[1] == MSG_MOUSEMOVE)
+    {
+        do_credits(t);
+        // The scheduler will change it latter.
+        t->quantum = QUANTUM_SYSTEM_TIME_CRITICAL;
+    }
+    */
+
+// ---------------------------------
+// Get the extra payload
+// The data here depends on the message code,
+    message_address[4] = (unsigned long) m->long3;
+    message_address[5] = (unsigned long) m->long4;
+
+// ---------------------------------
+// Get the identification field
+    message_address[8] = (unsigned long) m->sender_tid;
+    message_address[9] = (unsigned long) m->receiver_tid;
+    // We also have these elements. 
+    //m->sender_pid
+    //m->receiver_pid
+
+// ---------------------------------
+// Jiffies
+
+// Jiffies when the message was posted by the kernel.
+    message_address[10] = (unsigned long) m->long3; 
+// Jiffies when gotten by the app.
+    message_address[11] = (unsigned long) jiffies;
+
+// ----------------------------
+// Clear the entry
+// Consumimos a mensagem. Ela não existe mais.
+// Mas preservamos a estrutura.
+
+    // Standard header
+    m->opaque_window = NULL;
+    m->msg = 0;
+    m->long1 = 0;
+    m->long2 = 0;
+    // Extra payload
+    m->long3 = 0;
+    m->long4 = 0;
+    // Identification field
+    m->sender_tid = 0;
+    m->receiver_tid = 0;
+    m->sender_pid = 0;
+    m->receiver_pid = 0;
+
+    // End of queue. Round it.
+    t->MsgQueueHead++;
+    if (t->MsgQueueHead >= MSG_QUEUE_MAX){
+        t->MsgQueueHead=0;
+    }
+    // #test: Testing new routine.
+    // t->MsgQueueHead = ((t->MsgQueueHead + 1) % MSG_QUEUE_MAX);
+
+    // Yes, We have a message.
+    // #bugbug: 
+    // Maybe we can do this in a different way.
+    // But it could break the user application.
+    return (void *) 1;
+
+fail0:
+    // Invalid message pointer
+    if ((void*) m == NULL)
+    {
+        return NULL;
+    }
+fail:
+
+    // Block on empty
+    if (fBlockOnEmpty == TRUE && fEmpty == TRUE)
+    {
+        // Deferred block
+        if (t->msgctl.block_on_empty == TRUE)
+        {
+            // Two rounds
+            //if ( t->msgctl.miss_count > (MSG_QUEUE_MAX * 2) )
+            if ( t->msgctl.miss_count > (MSG_QUEUE_MAX + 4) )
+            {
+                t->msgctl.block_in_progress = TRUE;
+                t->msgctl.miss_count = 0;
+            }
+        }
+    }
+
+    // End of queue. Round it.
+    t->MsgQueueHead++;
+    if (t->MsgQueueHead >= MSG_QUEUE_MAX){
+        t->MsgQueueHead=0;
+    }
+    // t->MsgQueueHead = ((t->MsgQueueHead + 1) % MSG_QUEUE_MAX);
+    // No message
+    return NULL;
+}
+
+// sys_get_message:
+// Service 111.
+// Get a message from the current thread and 
+// put it into the given buffer.
+// The message has 6 standard elements.
+// Called by sci.c
+// It is called by the applications.
+// It is also used for ipc.
+void *sys_get_message(unsigned long ubuf)
+{
+// walks the circular queue slot by slot, consuming messages in order.
+
+    if (ubuf == 0)
+        panic ("sys_get_message: ubuf\n");
+// Call the worker
+    return (void*) ipc_get_message(ubuf);
+}
+
+// 120
+// Get a message given the index.
+// With restart support.
+// IN: buffer, index, flag: TRUE=restart the queue at the end.
+
+void *sys_get_message2(
+    unsigned long ubuf, 
+    int index, 
+    int restart)
+{
+// fetches a message by explicit index (with optional restart).
+
+    unsigned long *message_address = (unsigned long *) ubuf;
+    register struct thread_d *t;
+    register struct msg_d *m;
+    int fBlockOnEmpty = FALSE;
+    int fEmpty = FALSE;
+
+// buffer
+// #todo: Check some other invalid address.
+    if (ubuf == 0){ 
+        panic ("sys_get_message2: ubuf\n");
+        //return NULL;
+    }
+
+// Thread
+// Essa é a thread que chamou esse serviço.
+
+    if (current_thread<0 || current_thread>=THREAD_COUNT_MAX){
+        return NULL;
+    }
+
+// Structure
+    t = (void *) threadList[current_thread];
+    if ((void *) t == NULL){
+        panic ("sys_get_message2: t\n");
+    }
+    if ( t->used != TRUE || t->magic != 1234 ){
+        panic ("sys_get_message2: t validation\n");
+    }
+
+    // The thread wants to block on empty queue
+    if (t->msgctl.block_on_empty == TRUE)
+        fBlockOnEmpty = TRUE;
+
+// Get the index
+    if(index<0 || index >= MSG_QUEUE_MAX){
+        goto fail0;
+    }
+    t->MsgQueueHead = (int) (index & 0xFFFFFFFF);
+
+// ===========================================================
+// usando a fila de mensagens com estrutura.
+
+// Get the next head pointer.
+    m = (struct msg_d *) t->MsgQueue[ t->MsgQueueHead ];
+    if ((void*) m == NULL){
+        goto fail0;
+    }
+    if (m->used != TRUE || m->magic != 1234){
+        goto fail0;
+    }
+
+// Invalid message code
+    if (m->msg <= 0)
+    {
+        fEmpty = TRUE;
+        goto fail0;
+    }
+
+// -----------------------------
+// Get standard header
+    message_address[0] = (unsigned long) m->opaque_window;
+    message_address[1] = (unsigned long) (m->msg & 0xFFFFFFFF);
+    message_address[2] = (unsigned long) m->long1;
+    message_address[3] = (unsigned long) m->long2;
+
+// -----------------------------
+// Get extra payload
+    message_address[4] = (unsigned long) m->long3;
+    message_address[5] = (unsigned long) m->long4;
+
+// -----------------------------
+// Get identification field
+    message_address[8] = (unsigned long) m->sender_tid;
+    message_address[9] = (unsigned long) m->receiver_tid;
+    // We also have these elements. 
+    //m->sender_pid
+    //m->receiver_pid
+
+//
+// Jiffies
+//
+
+// -----------------------------
+// Jiffies when the message was posted by the kernel.
+    message_address[10] = (unsigned long) m->long3; 
+
+// -----------------------------
+// Jiffies when gotten by the app.
+    message_address[11] = (unsigned long) jiffies;
+
+// -------------------------------------------------
+// Clear the entry.
+// Consumimos a mensagem. Ela não existe mais.
+// Mas preservamos a estrutura.
+
+    // Standard header
+    m->opaque_window = NULL;
+    m->msg = 0;
+    m->long1 = 0;
+    m->long2 = 0;
+    // Extra payload
+    m->long3 = 0;
+    m->long4 = 0;
+    // Identification field
+    m->sender_tid = 0;
+    m->receiver_tid = 0;
+    m->sender_pid = 0;
+    m->receiver_pid = 0;
+
+// ==================================
+
+// Done
+// It is a valid thread pointer.
+    if (restart == TRUE)
+    {
+        t->MsgQueueHead=0;
+        t->MsgQueueTail=0;
+        return (void*) 1;
+    }
+
+// Yes, We have a message.
+// round
+    t->MsgQueueHead++;
+    if (t->MsgQueueHead >= MSG_QUEUE_MAX){
+        t->MsgQueueHead = 0;
+    }
+    return (void *) 1;
+
+// Is it a valid thread pointer?
+// No message.
+// round
+fail0:
+    // Invalid message pointer
+    if ((void*) m == NULL){
+        return NULL;
+    }
+fail:
+
+    // Block on empty
+    if (fBlockOnEmpty == TRUE && fEmpty == TRUE)
+    {
+        // Deferred block
+        if (t->msgctl.block_on_empty == TRUE)
+            t->msgctl.block_in_progress = TRUE;
+    }
+
+    if (restart == TRUE)
+    {
+        if ((void*) t != NULL){
+            t->MsgQueueHead=0;
+            t->MsgQueueTail=0;
+        }
+        return NULL;
+    }
+    if ((void*) t != NULL){
+        t->MsgQueueHead++;
+        if (t->MsgQueueHead >= MSG_QUEUE_MAX){
+            t->MsgQueueHead = 0;
+        }
+    }
+    return NULL;
+}
+
+// Service 112
+// Post message to tid.
+// Asynchronous.
+unsigned long
+sys_post_message_to_tid( 
+    int tid, 
+    unsigned long ubuf )
+{
+    tid_t src_tid = (tid_t) current_thread;   // caller's tid.
+    tid_t dst_tid = (tid_t) tid;              // targt tid.
+
+// Invalid target tid.
+    if ( dst_tid < 0 || dst_tid >= THREAD_COUNT_MAX ){
+        return 0;
+    }
+// Pointer to a ring 3 buffer.
+// #todo
+// Check the validation of this address agaisnt the valid user area,
+// cause this function will be called by the applications.
+// It needs to be abouve the user base area.
+    if (ubuf == 0){
+        return 0;
+    }
+    unsigned long *m = (unsigned long *) ubuf;
+// Get the message code.
+// Only the first 32 bits.
+    int MessageCode = (int) (m[1] & 0xFFFFFFFF);
+
+// Post message.
+// Asynchronous.
+// IN: target tid, opaque struct pointer, msg code, data1, data2.
+// #todo: get the return value?
+
+    // #ps: Old implementation
+    /*
+    post_message_to_tid(
+        (tid_t) src_tid,    // sender tid
+        (tid_t) dst_tid,    // receiver tid
+        (int) MessageCode,
+        (unsigned long) m[2],
+        (unsigned long) m[3] );
+    */
+
+    // #ps: Newm implementation. Sending more data.
+    ipc_post_message_to_tid2(
+        (tid_t) src_tid,    // sender tid
+        (tid_t) dst_tid,    // receiver tid
+        (int) MessageCode,
+        (unsigned long) m[2],
+        (unsigned long) m[3],
+        (unsigned long) m[4],
+        (unsigned long) m[5] );
+
+// Let's notify the scheduler
+// that we need some priority for the receiver in this case.
+    return 0;
+}
+
+// #todo
+// Not implemented i ring 3 yet.
+// Broadcast system message to all the threads.
+// IN: Buffer
+// OUT: The number of posted messages.
+unsigned long sys_broadcast_system_message(unsigned long ubuf)
+{
+    tid_t Sender_TID = (tid_t) current_thread;
+    unsigned long long_rv=0;
+
+// Pointer to a ring 3 buffer.
+// #todo
+// Check the validation of this address agaisnt the valid user area,
+// cause this function will be called by the applications.
+// It needs to be abouve the user base area.
+    if (ubuf == 0){
+        return 0;
+    }
+    unsigned long *m = (unsigned long *) ubuf;
+// Get the message code.
+// Only the first 32 bits.
+    int MessageCode = (int) (m[1] & 0xFFFFFFFF);
+
+// Call the worker.
+    long_rv = 
+    (unsigned long) ipc_broadcast_system_message(
+        (tid_t) Sender_TID, // The sender is always the current_thread.
+        (int) MessageCode,
+        (unsigned long) m[2],
+        (unsigned long) m[3],
+        (unsigned long) m[4],
+        (unsigned long) m[5] );
+
+    return (unsigned long) long_rv;
+}

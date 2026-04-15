@@ -1,0 +1,37 @@
+Kernel Folder Organization
+--------------------------
+
+The kernel source tree is organized into three main areas: the Gatehouse, the Halls, and the Library. 
+This structure is designed to make the entry points, management responsibilities, and shared definitions 
+clear and easy to navigate.
+
+1. gthouse/ (Gatehouse)
+   - Contains all code related to entering the kernel.
+   - Responsibilities:
+     * Entry point and initialization routines
+     * Syscall and interrupt stubs
+     * High-level kernel wrappers
+     * Shared kernel library (libk)
+     * User interface layer (input events and GDI)
+   - Subfolders:
+     * arch/   : Architecture-specific boot code and interrupt stubs
+     * kwrap/  : Kernel wrappers and abstractions
+     * libk/   : Shared kernel utilities
+     * wink/   : User interface handling (input + graphics)
+
+2. halls/ (Castle Halls)
+   - Contains the main management units of the kernel.
+   - Responsibilities are divided into three halls:
+     * exec/ (CPU Hall)    : Thread management, dispatcher, scheduler, exceptions
+     * req/  (Memory Hall) : Syscalls and memory management (mm/)
+     * per/  (IRQ Hall)    : Peripheral devices and interrupt handling
+
+3. include/ (Castle Library)
+   - Contains headers and shared definitions used across the kernel.
+   - Provides the common interfaces and constants that bind the system together.
+
+Summary:
+--------
+- All entry paths into the kernel (boot, syscalls, IRQs, ring 0 calls) converge in gthouse/.
+- All management responsibilities are handled inside the appropriate hall (exec, req, per).
+- All shared definitions and interfaces are stored in include/.

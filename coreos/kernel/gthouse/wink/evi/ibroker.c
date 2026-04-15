@@ -1,0 +1,4058 @@
+// ibroker.c
+// Event Broker for input events.
+// mouse/kdb/timer
+// Created by Fred Nora. 
+
+// This is an in-kernel input event handler.
+// PS2 keyboard, PS2 mouse and pit timer events goes here.
+// see: wmKeyEvent, wmMouseEvent and wmTimerEvent.
+
+/*
+Overview
+
+This file is the main event broker for input events within the Gramado kernel.
+It handles input from the PS/2 keyboard, PS/2 mouse, and PIT timer.
+Its responsibilities are to distribute (or "broker") these events to the correct destinations:
++ The event/message queue of the window/display server (for GUI events).
++ The stdin file/stream (for terminal and console input).
++ Some events, especially certain key combinations, are processed internally within the kernel.
+*/
+
+
+// This is the interface for the keyboard and mouse devices.
+// The input events for these devices goes here
+// and then they are send to the event queue in the 
+// window server's thread.
+
+#include <kernel.h>
+
+
+// ---------------------------------------------
+// Active keymap pointers
+// These point to the currently selected layout tables.
+// By default they are NULL until ibroker_set_keymap() is called.
+
+unsigned char *keymap_normal   = NULL;
+unsigned char *keymap_shift    = NULL;
+unsigned char *keymap_ctrl     = NULL;
+unsigned char *keymap_altgr    = NULL;
+unsigned char *keymap_extended = NULL; // new
+
+
+// Keyboard support
+//#define KEYBOARD_KEY_PRESSED  0x80
+#define KEYBOARD_KEY_MASK  0x7F
+//#define KEYBOARD_FULL      1
+//#define KEYBOARD_EMPTY     0
+//#define KEYBOARD_OBF       0x01    //Output buffer flag.
+
+#define BREAK_MASK  0x80
+
+
+// If it's allowed to reboot via CAD combination.
+static int CAD_is_allowed = TRUE;
+
+// ------------------------------
+// Input targets:
+// see: input.h
+struct input_targets_d  InputTargets;
+
+struct input_broker_info_d  InputBrokerInfo;
+
+static unsigned long mouse_x = 0;
+static unsigned long mouse_y = 0;
+
+//
+// ================================================
+//
+
+// Workers for the 'Compare string' function.
+static void do_enter_embedded_shell(int kernel_in_debug_mode);
+static void do_exit_embedded_shell(void);
+static void do_launch_app_via_initprocess(int index);
+static void do_user(void);
+
+// Compare strings
+static int __shellParseCommandLine(char *cmdline_address, size_t buffer_size);
+
+// Process extended keyboard strokes.
+static int 
+__ProcessExtendedKeyboardKeyStroke(
+    int prefix,
+    int msg, 
+    unsigned long vk,
+    unsigned long rawbyte,
+    unsigned long scancode );
+
+// Process input
+static int 
+__consoleProcessKeyboardInput ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 );
+
+// Process input
+// Not in console mode
+static int 
+__ProcessKeyboardInput ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 );
+
+
+static void setup_minimal_ring0_thread(void);
+
+static int
+ibroker_post_message_to_ds ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 );
+
+static int
+ibroker_post_message_to_fg_thread ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 );
+
+static int
+ibroker_app_wants_event(
+    int tid,
+    int msg,
+    unsigned long vk );
+
+
+static void ibroker_handle_boot_mode(char mode);
+
+//
+// ================================================
+//
+
+// Worker for boot mode commands
+static void ibroker_handle_boot_mode(char mode)
+{
+    char cnf_buffer[512];
+
+    if (mode != 'M' && mode != 'S') {
+        printk("Invalid boot mode\n");
+        return;
+    }
+
+    memset(cnf_buffer, 0, sizeof(cnf_buffer));
+    cnf_buffer[0] = mode;   // 'M' = Show menu, 'S' = Skip menu
+    memcpy(&cnf_buffer[1], "CNF", 3);  // Signature
+
+    // Save metafile to sectors 2 and 3
+    fs_store_boot_metafile(cnf_buffer, 1, 1);
+    fs_store_boot_metafile(cnf_buffer, 2, 1);
+
+    if (mode == 'M')
+        printk("Setting boot mode: SHOW MENU\n");
+    else
+        printk("Setting boot mode: SKIP MENU\n");
+}
+
+void ibroker_use_kernelside_mouse_drawing(int flag)
+{
+    if (flag == TRUE)
+    {
+        InputBrokerInfo.use_kernelside_mouse_drawing = TRUE;
+    } else {
+        InputBrokerInfo.use_kernelside_mouse_drawing = FALSE;
+    }
+}
+
+// API
+int ibroker_get_kernelside_mouse_drawing_status(void){
+    return (int) InputBrokerInfo.use_kernelside_mouse_drawing;
+}
+
+/*
+ * sys_change_boot_menu_option()
+ *
+ * System call wrapper to change the boot menu option.
+ * Receives one of two values as parameter:
+ *   1000 → set boot mode to SHOW MENU ('M')
+ *   1001 → set boot mode to SKIP MENU ('S')
+ *
+ * Internally delegates to ibroker_handle_boot_mode() to update
+ * the boot metafile and persist the configuration.
+ *
+ * Returns 0 on success, -1 on invalid parameter.
+ */
+
+unsigned long sys_change_boot_menu_option(unsigned long value)
+{
+    switch (value) {
+        case 1000:  // Show menu
+            ibroker_handle_boot_mode('M');
+            break;
+
+        case 1001:  // Skip menu
+            ibroker_handle_boot_mode('S');
+            break;
+
+        default:
+            // Invalid parameter
+            return (unsigned long) -1;
+    };
+
+    return 0; // success
+}
+
+// Post an event to the Display Server's thread
+static int
+ibroker_post_message_to_ds ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+    if (InputTargets.target_thread_queue != TRUE)
+        return (int) -1;
+    if (msg < 0)
+        return (int) -1;
+// Send it to the thread queue of the display server.
+    return (int) ipc_post_message_to_ds(msg,long1,long2);
+}
+
+// Post an event to the foreground thread
+static int
+ibroker_post_message_to_fg_thread ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+    struct thread_d *fg_thread;
+    int rv=-1;
+
+    if (msg < 0)
+        return (int) -1;
+
+// TARGET: GUI APP
+// Also to init thread
+
+// ---- Thread validation -----------------
+    if (foreground_thread < 0)
+        return (int) -1;
+    if (foreground_thread >= THREAD_COUNT_MAX)
+        return (int) -1;
+    fg_thread = (struct thread_d *) threadList[foreground_thread];
+    if ((void*) fg_thread == NULL)
+        return -1;
+    if (fg_thread->magic != 1234)
+        return -1;
+
+// ---- Message validation -----------------
+    int SendIt = TRUE;
+
+    if (msg == MSG_KEYDOWN) 
+    {
+        switch (long1) {
+        // The problem is: 
+        // TAB can end up being delivered to both the display server and the foreground app.
+        case VK_TAB:
+            SendIt = FALSE;
+            if (fg_thread->msgctl.input_flags & THREAD_WANTS_TAB)
+                SendIt = TRUE;
+            break;
+
+        //case VK_ESCAPE:
+            //SendIt = FALSE;
+            //if (fg_thread->msgctl.input_flags & THREAD_WANTS_ESC)
+                //SendIt = TRUE;
+            //break;
+
+        // #todo: Add more keys (F1..F12, arrows, etc.)
+        };
+    }
+
+// Do not send it
+    if (SendIt != TRUE)
+        return (int) -1;
+
+// Send it
+    rv = 
+    (int) ipc_post_message_to_tid(
+            (tid_t) __HARDWARE_TID, 
+            (tid_t) foreground_thread,
+            msg, long1, long2 );
+
+    return (int) rv;
+}
+
+// Check if the foreground app wants this event.
+// Returns TRUE if the app has requested it, FALSE otherwise.
+// This function is the keypoint, where it checks 
+// if the current event is desired by the thread or not.
+static int
+ibroker_app_wants_event(
+    int tid,
+    int msg,
+    unsigned long vk )
+{
+    struct thread_d *fg_thread;
+
+    if (msg < 0)
+        return FALSE;
+
+    // Validate foreground thread
+    if (tid < 0 || tid >= THREAD_COUNT_MAX)
+        return FALSE;
+
+    fg_thread = (struct thread_d *) threadList[tid];
+    if ((void*) fg_thread == NULL)
+        return FALSE;
+    if (fg_thread->magic != 1234)
+        return FALSE;
+
+// Only check key events for now
+    if (msg == MSG_KEYDOWN) 
+    {
+        switch (vk) {
+        case VK_TAB:
+            if (fg_thread->msgctl.input_flags & THREAD_WANTS_TAB)
+                return TRUE;
+            return FALSE;
+            break;
+
+        // #test
+        case VK_ESCAPE:
+            if (fg_thread->msgctl.input_flags & THREAD_WANTS_ESC)
+                return TRUE;
+            return FALSE;
+            break;
+
+        // Add more keys here (F1..F12, arrows, etc.)
+        }
+    }
+
+/*
+    if (msg == MSG_KEYUP)
+    {
+    }
+*/ 
+
+    return FALSE;
+}
+
+// ---------------------------------------------
+// Plug in a layout
+// IN: addresses of normal, shift, ctrl, and altgr tables.
+// Example: set_keymap(abnt2_normal, abnt2_shift, abnt2_ctrl, abnt2_altgr);
+
+void 
+ibroker_set_keymap(
+    unsigned char *p_normal,
+    unsigned char *p_shift,
+    unsigned char *p_ctrl,
+    unsigned char *p_altgr,
+    unsigned char *p_extended )
+{
+    keymap_normal   = p_normal;
+    keymap_shift    = p_shift;
+    keymap_ctrl     = p_ctrl;
+    keymap_altgr    = p_altgr;
+    keymap_extended = p_extended; // new
+}
+
+// Minimal ring 0 thread example
+static void setup_minimal_ring0_thread(void)
+{
+    unsigned long stack_base = (unsigned long) kmalloc(4096);
+    unsigned long entry_point = (unsigned long) &keEarlyRing0IdleThread;
+
+    struct thread_d *t = create_thread(
+        THREAD_TYPE_SYSTEM,  // type
+        NULL,              // cg
+        entry_point,       // initial RIP
+        stack_base + 4096, // initial RSP (top of stack)
+        0,                 // owner PID (0 for kernel)
+        "ring0-worker",    // thread name
+        RING0              // CPL = 0 (kernel mode)
+    );
+
+    if ((void*)t == NULL) {
+        panic("Failed to create ring0 thread");
+    }
+
+    // Mark it ready to run
+    SelectForExecution(t);
+}
+
+// Send ascii to the tty associated with stdin.
+int ibroker_send_ascii_to_stdin(int ascii_code) 
+{
+    size_t wbytes = 0;
+    struct tty_d *target_tty;
+
+    if ((void*)stdin == NULL)
+        return 0;
+    if (stdin->magic != 1234)
+        return 0;
+
+// The tty associated with stdin.
+    target_tty = stdin->tty;
+
+    if ((void*)target_tty == NULL)
+        return 0;
+
+    if (target_tty->magic != 1234)
+        return 0;
+
+// Send the ascii code to the tty associated with stdin.
+// (ascii in this case)
+    wbytes = 
+        (int) tty_queue_putchar( &target_tty->raw_queue, (char) ascii_code );
+
+    return (int) wbytes;
+}
+
+void input_enter_kernel_console(void)
+{
+    do_enter_embedded_shell(FALSE);
+}
+
+void input_exit_kernel_console(void)
+{
+    do_exit_embedded_shell();
+}
+
+// Process CAD combination
+int input_process_cad_combination(unsigned long flags)
+{
+// If it's allowed to reboot via CAD combination.
+// Calling the wrapper to have a safe reboot.
+
+    if (CAD_is_allowed == TRUE){
+        return (int) do_reboot(flags);
+    }
+
+    return (int) -1;
+}
+
+// Selecting the input targets
+int input_enable_this_input_target(int this_one)
+{
+    switch (this_one)
+    {
+        case INPUT_TARGET_STDIN:
+            InputTargets.target_stdin = TRUE;
+            break;
+        case INPUT_TARGET_THREAD_QUEUE:
+            InputTargets.target_thread_queue = TRUE;
+            break;
+        default:
+            return (int) -1;
+            break;
+    };
+
+    return 0;
+}
+
+int input_disable_this_input_target(int this_one)
+{
+    switch (this_one)
+    {
+        case INPUT_TARGET_STDIN:
+            InputTargets.target_stdin = FALSE;
+            break;
+        case INPUT_TARGET_THREAD_QUEUE:
+            InputTargets.target_thread_queue = FALSE;
+            break;
+        default:
+            return (int) -1;
+            break;
+    };
+
+    return 0;
+}
+
+
+//
+// $
+// ENTER/EXIT KERNEL CONSOLE
+//
+
+static void do_enter_embedded_shell(int kernel_in_debug_mode)
+{
+    int console_index = fg_console;
+    // InputBrokerInfo.shell_flag = FALSE;
+
+// #test
+// Reactivate the usage of printk in the kernel console.
+    Initialization.printk_to_serial = FALSE;
+
+// Set up console
+    jobcontrol_switch_console(0);
+// Message
+    if (kernel_in_debug_mode){
+        printk("[[ KERNEL IN DEBUG MODE ]]\n");
+    }
+    //printk("kernel console number %d\n",console_index);
+    //printk("Prompt ON: Type something\n");
+    //consolePrompt();  // It will refresh the screen.
+
+// Flag
+    InputBrokerInfo.shell_flag = TRUE;
+}
+
+static void do_exit_embedded_shell(void)
+{
+
+// log
+    printk("\n");
+    printk("Prompt OFF: Bye\n");
+    printk("\n");
+    refresh_screen();
+
+// Supress the use of printk in the kernel console 
+// if it is what the configuration wants.
+    if (CONFIG_PRINTK_TO_SERIAL == 1){
+        Initialization.printk_to_serial = TRUE;
+    }else{
+        Initialization.printk_to_serial = FALSE;
+    }
+
+// done
+    InputBrokerInfo.shell_flag = FALSE;
+}
+
+// Launch an app via init process.
+// Just a small range of messages are accepted.
+// range: 4001~4009
+// #important: 
+// Only when we have a registered display server.
+// Can't do it without a valid registered display server
+// The init process will launch a Cliet-side GUI application.
+// #test: 
+// This is a test. 
+// The kernel can't know about this type of application.
+static void do_launch_app_via_initprocess(int index)
+{
+
+// Kernel is the sender and init process is the receiver
+    const tid_t src_tid = (tid_t) __HARDWARE_TID;
+    const tid_t dst_tid = (tid_t) INIT_TID;
+
+// This is an index that selects what app the 
+// init process needs to launch.
+    unsigned long AppIndex = (index & 0xFFFFFFFF);
+
+// Invalid app index
+    if (AppIndex < 4001 || AppIndex > 4009)
+    {
+        return;
+    }
+
+// Can't do it without a valid registered display server
+// It's because the app is a client-side GUI application
+    if (DisplayServerInfo.initialized != TRUE){
+        return;
+    }
+
+// Force unblocking
+    // do_thread_ready(dst_tid);
+
+// Sending a MSG_COMMAND message to the init process
+// IN: sender tid, receiver tid, msg, index(4001~4009), 0
+    ipc_post_message_to_tid(
+        (tid_t) src_tid, 
+        (tid_t) dst_tid,
+        (int) MSG_COMMAND, 
+        (unsigned long) AppIndex, 
+        0 );
+}
+
+// Process 'user' command.
+// Print info into the kernel console.
+static void do_user(void)
+{
+    int IsSuper = FALSE;
+    int id = -1;
+
+    if ((void*) CurrentUser == NULL)
+        return;
+    if (CurrentUser->magic != 1234)
+        return;
+    if (CurrentUser->initialized != TRUE){
+        return;
+    }
+    id = CurrentUser->userId;
+
+// Print the username.
+    printk("Username: {%s}\n",CurrentUser->__username);
+
+// Is it really the current user?
+// Is it the super user?
+    if (id == current_user)
+    {
+        IsSuper = is_superuser(); 
+        if (IsSuper == TRUE)
+            printk("It's super\n");
+    }
+}
+
+// Compare the strings that were
+// typed into the kernel virtual console.
+static int __shellParseCommandLine(char *cmdline_address, size_t buffer_size)
+{
+    int status=0;
+    int fpu_status = -1;
+    unsigned long LongValue = 0;
+
+// Pointer for the cmdline.
+    //char *cmdline = (char *) prompt;  // Old
+    char *cmdline = (char *) cmdline_address;
+
+    //debug_print("consoleCompareStrings: \n");
+    printk("\n");
+
+    if ((void*) cmdline == NULL){
+        printk("Invalid cmdline\n");
+        goto exit_cmp;
+    }
+    if (buffer_size <= 0){
+        printk("Invalid buffer_size\n");
+        goto exit_cmp;
+    }
+
+// ==================
+
+// about: 
+// Print banner but do not clear the screen (FALSE).
+    if ( kstrncmp( cmdline, "about", 5 ) == 0 )
+    {
+        wink_show_banner(FALSE);
+        printk("The kernel console\n");
+        goto exit_cmp;
+    }
+
+//
+// Update metafile for boot configuration.
+//
+
+//Command parsing:
+// boot-m → sets metafile to "M" (show menu).
+// boot-s → sets metafile to "S" (skip menu).
+
+// Temporary buffer for metafile
+    // char cnf_buffer[512];
+
+// boot-m:
+// Save 'M' (Show menu)
+    if (kstrncmp(cmdline, "boot-m", 6) == 0)
+    {
+        /*
+        printk("Setting boot mode: SHOW MENU\n");
+        memset(cnf_buffer, 0, 512);
+        cnf_buffer[0] = 'M';  // Boot mode
+        memcpy(&cnf_buffer[1], "CNF", 3);  // Signature
+        fs_store_boot_metafile(cnf_buffer, 1, 1);  // Save to sector 2
+        fs_store_boot_metafile(cnf_buffer, 2, 1);  // Save to sector 3
+        */
+
+        ibroker_handle_boot_mode('M');
+        goto exit_cmp;
+    }
+
+// boot-s:
+// Save 'S' (Skip menu)
+    if (kstrncmp(cmdline, "boot-s", 6) == 0)
+    {
+        /*
+        printk("Setting boot mode: SKIP MENU\n");
+        memset(cnf_buffer, 0, 512);
+        cnf_buffer[0] = 'S';  // Boot mode
+        memcpy(&cnf_buffer[1], "CNF", 3);  // Signature
+        fs_store_boot_metafile(cnf_buffer, 1, 1);  // Save to sector 2
+        fs_store_boot_metafile(cnf_buffer, 2, 1);  // Save to sector 3
+        */
+
+        ibroker_handle_boot_mode('S');
+        goto exit_cmp;
+    }
+
+// active: Count active threads.
+    if ( kstrncmp(cmdline,"active",6) == 0){
+        LongValue = (unsigned long) sched_count_active_threads();
+        printk("Active threads: {%d}\n",LongValue);
+        goto exit_cmp;
+    }
+
+// smp
+// #todo
+// Use the structure smp_info 
+// to show the information about the smp initialization.
+    if ( kstrncmp(cmdline,"smp",3) == 0 )
+    {
+        //printk("Processor count: {%d}\n", 
+            //smp_info.mptable_number_of_processors );
+
+        x64smp_show_info();
+        goto exit_cmp;
+    }
+
+// Unmask lapic timer.
+    if ( kstrncmp(cmdline,"timer",5) == 0 )
+    {
+        // IN: vector number, 1=masked
+        //apic_timer_setup_periodic(220,0);
+        goto exit_cmp;
+    }
+
+// Has syscall support?
+    if ( kstrncmp(cmdline,"syscall",7) == 0 )
+    {
+        //probe_if_cpu_has_support_to_syscall();
+        initialize_syscall();
+        goto exit_cmp;
+    }
+
+
+// mbr:
+// see: storage.c
+    if ( kstrncmp(cmdline,"mbr",3) == 0 ){
+        disk_show_mbr_info();
+        goto exit_cmp;
+    }
+
+//
+// Network stuff
+//
+
+    if ( kstrncmp(cmdline,"test-nic",8) == 0 ){
+        network_test_NIC();
+        goto exit_cmp;
+    }
+    // Print arp table.
+    if ( kstrncmp(cmdline,"arp",3) == 0 ){
+        arp_show_table();
+        goto exit_cmp;
+    }
+    if ( kstrncmp(cmdline,"test-arp",8) == 0 ){
+        network_send_arp_request();
+        goto exit_cmp;
+    }
+    if ( kstrncmp(cmdline,"test-arp-2",10) == 0 ){
+        network_send_arp_request2();
+        goto exit_cmp;
+    }
+    if (kstrncmp(cmdline,"udp",3) == 0)
+    {
+        //#test: Test sender.
+        goto exit_cmp;
+    }
+
+    if ( kstrncmp(cmdline,"test-udp",8) == 0 ){
+        network_test_udp();
+        goto exit_cmp;
+    }
+    if ( kstrncmp(cmdline,"test-udp-2",10) == 0 ){
+        network_test_udp2();
+        goto exit_cmp;
+    }
+    if ( kstrncmp(cmdline,"dhcp",4) == 0 ){
+        network_show_dhcp_info();
+        goto exit_cmp;
+    }
+    if ( kstrncmp(cmdline,"test-dhcp",9) == 0 ){
+        network_initialize_dhcp();
+        goto exit_cmp;
+    }
+
+    // net-on (same as term00)
+    if ( kstrncmp(cmdline,"net-on",6) == 0 )
+    {
+        networkUnlock();
+        network_initialize_dhcp();
+        goto exit_cmp;
+    }
+    // net-off (same as term00)
+    if ( kstrncmp(cmdline,"net-off",7) == 0 )
+    {
+        networkLock();
+        goto exit_cmp;
+    }
+
+
+// string: Testing string functions.
+    if ( kstrncmp(cmdline,"string",6) == 0 )
+    {
+        console_print_indent(4,fg_console);
+        console_write_string(fg_console,"This is a string\n");
+        console_print_indent(8,fg_console);
+        console_write_string(fg_console,"This is another string\n");
+        //__respond(fg_console);
+        goto exit_cmp;
+    }
+
+// csi: Test CSI cursor movement and editing commands.
+    if ( kstrncmp(cmdline,"csi",3) == 0 )
+    {
+        console_write_string(fg_console, "Testing CSI sequences...\n");
+
+        // Start at a known position
+        //__local_gotoxy(10, 10, fg_console);
+        console_write_string(fg_console, "X");
+
+        // Cursor Up (A)
+        console_write_string(fg_console, "\033[3A");
+        console_write_string(fg_console, "A");
+
+        // Cursor Down (B)
+        console_write_string(fg_console, "\033[2B");
+        console_write_string(fg_console, "B");
+
+        // Cursor Forward (C)
+        console_write_string(fg_console, "\033[5C");
+        console_write_string(fg_console, "C");
+
+        // Cursor Backward (D)
+        console_write_string(fg_console, "\033[3D");
+        console_write_string(fg_console, "D");
+
+        // Erase in Line (K)
+        console_write_string(fg_console, "\nLine before erase...");
+        console_write_string(fg_console, "\033[2K");
+        console_write_string(fg_console, "Line erased with CSI 2 K\n");
+
+        // Insert Line (L)
+        console_write_string(fg_console, "Line 1\n");
+        console_write_string(fg_console, "Line 2\n");
+        console_write_string(fg_console, "Line 3\n");
+        console_write_string(fg_console, "\033[2A");  // Move up 2
+        console_write_string(fg_console, "\033[1L");  // Insert 1 line
+        console_write_string(fg_console, "Inserted line above\n");
+
+        // Delete Line (M)
+        console_write_string(fg_console, "Line A\n");
+        console_write_string(fg_console, "Line B\n");
+        console_write_string(fg_console, "Line C\n");
+        console_write_string(fg_console, "\033[2A");  // Move up 2
+        console_write_string(fg_console, "\033[1M");  // Delete 1 line
+        console_write_string(fg_console, "Deleted line above\n");
+
+        console_write_string(fg_console, "\nCSI test complete.\n");
+
+        goto exit_cmp;
+    }
+
+// see: mod.c
+// Vamos testar um modulo que ja foi carregado previamente?
+    if ( kstrncmp(cmdline,"mod0",4) == 0 ){
+        test_mod0();
+        goto exit_cmp;
+    }
+
+// dir:
+// List the files in a given directory.
+    if ( kstrncmp(cmdline,"dir",3) == 0 )
+    {
+        fsList("[");  // root dir. Same as '/'.
+        //fsList("GRAMADO");
+        //fsList("DE");
+        goto exit_cmp;
+    }
+
+// Testing vga stuff.
+// #
+// We already called vga1.bin in ring 3?
+// #test
+// Notificando o window server que a resolução mudou.
+// #todo
+// Muidas estruturas aindapossuem valores que estão condizentes
+// com a resolução antiga e precisa ser atualizados.
+
+/*
+    if ( kstrncmp(cmdline,"vga1",4) == 0 ){
+        printk ("vga1: This is a work in progress ...\n");
+        goto exit_cmp;
+    }
+*/
+
+// exit: Exit the embedded kernel console.
+    if ( kstrncmp(cmdline,"exit",4) == 0 ){
+        input_exit_kernel_console(); 
+        goto exit_cmp;
+    }
+
+// disk: Show disk info.
+// See: storage.c
+    if ( kstrncmp( cmdline, "disk", 4 ) == 0 )
+    {
+        //diskShowCurrentDiskInfo();  // Current disk
+        disk_show_info();  // All disks.
+        goto exit_cmp;
+    }
+
+// ata: Show some disk information.
+// See: atainfo.c
+    if ( kstrncmp( cmdline, "ata", 3 ) == 0 )
+    {
+        //printk("ATA controller information:\n");
+        //ata_show_ata_controller_info();
+        //ata_show_ide_info();
+        //ata_show_device_list_info();
+        ata_show_ata_info_for_boot_disk();
+        printk("Number of sectors in boot disk: {%d}\n",
+            gNumberOfSectorsInBootDisk );
+        goto exit_cmp;
+    }
+
+// volume: Show some volume information.
+    if ( kstrncmp(cmdline,"volume",6) == 0 )
+    {
+        volume_show_info();
+        goto exit_cmp;
+    }
+// #test
+// Get volume label from the first entry.
+// see: fat16.c
+    if ( kstrncmp(cmdline,"vol-label",9) == 0 ){
+        test_fat16_find_volume_info();
+        goto exit_cmp;
+    }
+
+// device: Device list.
+// Show tty devices, pci devices and devices with regular file.
+// See: devmgr.c
+    if ( kstrncmp(cmdline,"device",6) == 0 )
+    {
+        //printk("\n");
+        //printk("Devices:\n");
+        //devmgr_show_device_list(0);
+
+        printk("\n");
+        printk("Legacy Devices:\n");
+        devmgr_show_device_list(ObjectTypeLegacyDevice);
+
+        printk("\n");
+        printk("PCI Devices:\n");
+        devmgr_show_device_list(ObjectTypePciDevice);
+
+        printk("\n");
+        printk("TTY Devices:\n");
+        devmgr_show_device_list(ObjectTypeTTY);
+
+        printk("\n");
+        printk("Virtual Consoles:\n");
+        devmgr_show_device_list(ObjectTypeVirtualConsole);
+
+        //printk("\n");
+        //printk("Regular FileDevices:\n");
+        //devmgr_show_device_list(ObjectTypeFile);
+
+        // ...
+
+        goto exit_cmp;
+    }
+
+// pci:
+// See: pciinfo.c
+    if ( kstrncmp( cmdline, "pci", 3 ) == 0 ){
+        printk("~pci:\n");
+        pciInfo();
+        goto exit_cmp;
+    }
+
+// full initialization of PS2 kbd/mouse interface.
+    if ( kstrncmp( cmdline, "ps2-full", 8) == 0){
+        printk("~full ps2 initialization\n");
+        DDINIT_ps2();
+        goto exit_cmp;
+    }
+
+// user:
+    if ( kstrncmp( cmdline, "user", 4 ) == 0 ){
+        do_user();
+        goto exit_cmp;
+    }
+
+// cls:
+    if ( kstrncmp( cmdline, "cls", 3 ) == 0 ){
+        console_clear();
+        goto exit_cmp;
+    }
+
+// console:
+    if ( kstrncmp( cmdline, "console", 7 ) == 0 )
+    {
+        printk("Console number: {%d}\n",fg_console);
+        goto exit_cmp;
+    }
+
+// sched:
+    if ( kstrncmp( cmdline, "sched", 5 ) == 0 )
+    {
+        sched_show_info();
+        goto exit_cmp;
+    }
+
+// cpu: Display cpu info.
+// see: x64info.c
+    if ( kstrncmp( cmdline, "cpu", 3 ) == 0 ){
+        x64_info();
+        //extra
+        if (SchedulerInfo.initialized == TRUE)
+            printk("Scheduler policy: %d\n",SchedulerInfo.policy);
+        goto exit_cmp;
+    }
+
+// display:
+    if ( kstrncmp( cmdline, "display", 7 ) == 0 ){
+        bldisp_show_info();  //bl display device.
+        goto exit_cmp;
+    }
+
+// pit: Display PIT info.
+    if ( kstrncmp( cmdline, "pit", 3 ) == 0 )
+    {
+        // #todo: Create pitShowInfo() in pit.c.
+        printk("Dev freq: %d | Clocks per sec: %d HZ | Period: %d\n",
+            PITInfo.dev_freq,
+            PITInfo.clocks_per_sec,
+            PITInfo.period );
+        goto exit_cmp;
+    }
+
+// help:
+    if ( kstrncmp( cmdline, "help", 4 ) == 0 ){
+        printk("Commands: about, help, reboot, cpu, memory, ...\n");
+        goto exit_cmp;
+    }
+
+    // gdt: 
+    // #bugbug: We can't trust in these values yet.
+    unsigned long *a;
+    unsigned long *b;
+    // We have two gdts: EARLY_GDT64 and xxx_gdt;
+    // 
+    if ( kstrncmp( cmdline, "gdt", 3 ) == 0 )
+    {
+        a = (unsigned long *) &xxx_gdt[0];
+        b = (unsigned long *) &xxx_gdt[0] + 32;
+        printk("0: %x %x\n",a[0],b[0]);
+
+        a = (unsigned long *) &xxx_gdt[1];
+        b = (unsigned long *) &xxx_gdt[1] + 32;
+        printk("1: %x %x\n",a[0],b[0]);
+
+        a = (unsigned long *) &xxx_gdt[2];
+        b = (unsigned long *) &xxx_gdt[2] + 32;
+        printk("2: %x %x\n",a[0],b[0]);
+
+        a = (unsigned long *) &xxx_gdt[3];
+        b = (unsigned long *) &xxx_gdt[3] + 32;
+        printk("3: %x %x\n",a[0],b[0]);
+
+        a = (unsigned long *) &xxx_gdt[4];
+        b = (unsigned long *) &xxx_gdt[4] + 32;
+        printk("4: %x %x\n",a[0],b[0]);
+
+        a = (unsigned long *) &xxx_gdt[5];
+        b = (unsigned long *) &xxx_gdt[5] + 32;
+        printk("5: %x %x\n",a[0],b[0]);
+
+        goto exit_cmp;
+    }
+
+// memory:
+    if ( kstrncmp( cmdline, "memory", 6 ) == 0 ){
+        mmShowMemoryInfo();
+        goto exit_cmp;
+    }
+
+// mm1: 
+// Show paged memory list.
+// #todo: Explain it better.
+// IN: max index.
+    if ( kstrncmp(cmdline,"mm1",3) == 0 ){
+        mmShowPagedMemoryList(512); 
+        goto exit_cmp;
+    }
+
+// mm2: 
+// Show the blocks allocated by the kernel allocator.
+// It's inside the kernel heap.
+// #todo: Explain it better.
+    if ( kstrncmp(cmdline,"mm2",3) == 0 ){
+        mmShowMemoryBlocksForTheKernelAllocator(); 
+        goto exit_cmp;
+    }
+
+// Simple test for heap allocation, free, and reuse.
+// Allocates memory, frees it, and reuses it in a loop.
+    if ( kstrncmp(cmdline,"mm-reuse",8) == 0 ){
+
+        // Test heap reuse
+        test_heap_reuse();
+
+        // Debug print heap state
+        // mmblock_debug_print();
+
+        // Testing the %p format specifier.
+        // printk("mm-reuse: Pointer: {%p}\n",cmdline);
+        goto exit_cmp;
+    }
+
+
+// path:
+// Test the use of 'pathnames' with multiple levels.
+// #test: This test will allocate some pages
+// for the buffer where we are gonna load the file.
+    if ( kstrncmp(cmdline,"path",4) == 0 ){
+        //__test_path();
+        goto exit_cmp;
+    }
+
+// process:
+    if ( kstrncmp( cmdline, "process", 7 ) == 0 )
+    {
+        show_process_information();
+        goto exit_cmp;
+    }
+
+// thread:
+    if ( kstrncmp( cmdline, "thread", 6 ) == 0 )
+    {
+        show_thread_information();
+        goto exit_cmp;
+    }
+
+/*
+// Launch a ring 0 thread
+// #bugbug: We're still working to support ring 0 threads.
+    if ( kstrncmp( cmdline, "r0-thread", 9 ) == 0 )
+    {
+        //setup_minimal_ring0_thread();
+        goto exit_cmp;
+    }
+*/
+
+// Test if some AP put the signature in a given address.
+    unsigned char *ap_signature_pointer = 
+        (unsigned char *) 0x00029000; //0x9000;
+
+    if ( kstrncmp( cmdline, "ap", 2 ) == 0 )
+    {
+        if (ap_signature_pointer[0] == 0xA0 && 
+            ap_signature_pointer[1] == 0xA0)
+        {
+            printk("AP is running!\n");
+        }
+        goto exit_cmp;
+    }
+
+// ps2-qemu:
+// Testing the full initialization of ps2 interface.
+// This is a work in progress.
+// See: i8042.c
+    if ( kstrncmp( cmdline, "ps2-qemu", 8 ) == 0 )
+    {
+        if (HVInfo.initialized == TRUE){
+            if (HVInfo.type == HV_TYPE_TCG)
+            {
+                printk("#test: PS2 full initialization on qemu\n");
+                hv_ps2_full_initialization();
+            }
+        }
+        goto exit_cmp;
+    }
+
+// ps2-kvm: Initializze the ps2 support when running on kvm.
+// #bugbug
+// The initialization is not working on kvm.
+    if ( kstrncmp( cmdline, "ps2-kvm", 7 ) == 0 )
+    {
+        printk ("#todo: Initialization not working on kvm\n");
+        if (HVInfo.initialized == TRUE){
+            if (HVInfo.type == HV_TYPE_TCG){
+                //printk("#test: PS2 full initialization on kvm\n");
+                //PS2_initialization();
+            }
+        }
+        goto exit_cmp;
+    }
+
+// reboot:
+    if ( kstrncmp( cmdline, "reboot", 6 ) == 0 )
+    {
+        keReboot();
+        goto exit_cmp;
+    }
+
+// beep:
+    if ( kstrncmp( cmdline, "beep", 4 ) == 0 ){
+        hal_test_speaker();
+        goto exit_cmp;
+    }
+
+// tty: Read and write from tty device.
+// The console is inside the kernel. The routine will get the fd 1 
+// for the current process, that i don't know what process is. 
+// But probably fd=1 represents the current console. If we write() into 
+// this file it will display the message in the screen. But in our case 
+// we're simply getting the tty associated with the file.
+
+
+    struct tty_d *myTTY00 = (struct tty_d *) &CONSOLE_TTYS[0];
+    struct tty_d *myTTY01 = (struct tty_d *) &CONSOLE_TTYS[1];
+    if ( kstrncmp( cmdline, "tty", 3 ) == 0 )
+    {
+        // Select the worker,
+        // it determines the destination.
+        //tty_set_output_worker(myTTY, TTY_OUTPUT_WORKER_FGCONSOLE);
+        //tty_set_output_worker(myTTY, TTY_OUTPUT_WORKER_SERIALPORT);
+
+        //tty_write(1,"Hello",5); // failing
+
+        // Raw queue
+        //__tty_write (myTTY,"Hello Raw Queue",15);
+        //tty_flush_raw_queue(myTTY,fg_console);
+
+
+        // Console 0
+        __tty_write2 (myTTY00,"Hello myTTY00\n",14);
+        tty_flush(myTTY00);
+
+        // Console 1
+        __tty_write2 (myTTY01,"Hello myTTY01",13);
+        tty_flush(myTTY01);
+
+        // TTY associated with the stdout fp.
+        // #fail
+        //__tty_write2 (stdout->tty,"Hello stdout",12);
+        //tty_flush(stdout->tty);
+
+        goto exit_cmp;
+    }
+
+// serial: Display serial support info.
+// #todo: Only com1 for now.
+// But we can get information for all the 4 ports.
+    if ( kstrncmp( cmdline, "serial", 6 ) == 0 )
+    {
+        //#todo: Create serialShowInfo in serial.c.
+        //#todo: Only com1 for now.
+        printk("com1.divisor:       %d\n",
+            SerialPortInfo.com1.divisor );
+        printk("com1.divisorLoByte: %d\n",
+            SerialPortInfo.com1.divisorLoByte );
+        printk("com1.divisorHiByte: %d\n",
+            SerialPortInfo.com1.divisorHiByte );
+        printk("com1.baud_rate:      %d\n",
+            SerialPortInfo.com1.baud_rate );
+        printk("com1.is_faulty:      %d\n",
+            SerialPortInfo.com1.is_faulty );
+        goto exit_cmp;
+    }
+
+// ========
+// close: Sending a MSG_CLOSE messsage to the init thread.
+    if ( kstrncmp(cmdline,"close",5) == 0 ){
+        keCloseInitProcess();
+        goto exit_cmp;
+    }
+
+// Invalid command
+    printk ("Error: Command not found!\n");
+
+exit_cmp:
+    // Nothing
+done:
+    consolePrompt();
+    return 0;
+}
+
+// Main routine for the embedded shell.
+// It compares two strings and process the service.
+// The command line is in prompt[] buffer.
+int ksys_shell_parse_cmdline(char *cmdline_address, size_t buffer_size)
+{
+
+// #todo
+// We can check some conditions, just like if the 
+// shell was already initialized.
+// We can also have another shells inside the kernel,
+// maybe in a loadable module. mod0.
+
+    if (InputBrokerInfo.shell_flag != TRUE)
+        goto fail;
+
+// prompt[] buffer is where the command line is.
+    __shellParseCommandLine(prompt, sizeof(prompt));
+
+// Show any printing message from the functions above.
+    //invalidate_screen();
+    refresh_screen();
+    return 0;
+
+fail: 
+    return (int) -1;
+}
+
+// Process key strokes for extended keyboard
+static int 
+__ProcessExtendedKeyboardKeyStroke(
+    int prefix,
+    int msg, 
+    unsigned long vk,
+    unsigned long rawbyte,
+    unsigned long scancode )
+{
+    unsigned long ScanCode = (unsigned long) scancode;
+
+    // #debug
+    // printk("vk={%x} rc={%x} sc={%x}\n", vk, rawbyte, scancode);
+
+    //printk("Extended key: prefix=%x msg=%d vk=%x raw=%x sc=%x\n",
+       //prefix, msg, vk, rawbyte, scancode);
+
+    // unsigned long
+    if (rawbyte >= 0xFF){
+        goto fail;
+    }
+
+// Pause/break support
+    if (vk == VK_PAUSEBREAK)
+    {
+        if (msg == MSG_SYSKEYDOWN)
+            printk("VK_PAUSEBREAK down\n");
+        if (msg == MSG_SYSKEYUP)
+            printk("VK_PAUSEBREAK up\n");
+    }
+
+// ================================================================
+// ########  The app receiving all the keys is editor.bin #########
+// ================================================================
+
+    switch (msg)
+    {
+        case MSG_SYSKEYDOWN:
+        //printk("broker: MSG_SYSKEYDOWN sc=%d\n",ScanCode);
+
+            // Right ENTER
+            if (vk == VK_RETURN)
+            {
+                if (ctrl_status == TRUE){
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_KEYDOWN, VK_RETURN, ScanCode );
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_RIGHT)
+            {
+                if (ctrl_status == TRUE){
+                    ibroker_post_message_to_ds( MSG_CONTROL_ARROW_RIGHT, VK_ARROW_RIGHT, ScanCode );
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_ARROW_RIGHT, ScanCode );
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_UP)
+            {
+                if (ctrl_status == TRUE){
+                    ibroker_post_message_to_ds( MSG_CONTROL_ARROW_UP, VK_ARROW_UP, ScanCode );
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_ARROW_UP, ScanCode );
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_DOWN)
+            {
+                if (ctrl_status == TRUE){
+                    ibroker_post_message_to_ds( MSG_CONTROL_ARROW_DOWN, VK_ARROW_DOWN, ScanCode );
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_ARROW_DOWN, ScanCode );                    
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_LEFT)
+            {
+                if (ctrl_status == TRUE){
+                    ibroker_post_message_to_ds( MSG_CONTROL_ARROW_LEFT, VK_ARROW_LEFT, ScanCode );
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_ARROW_LEFT, ScanCode );
+                    return 0;
+                }
+            }
+
+            // Insert - E0 52	E0 D2	0x52
+            if (vk == VK_INSERT)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_INSERT, ScanCode );
+                return 0;
+            }
+
+            // Delete - E0 53	E0 D3	0x53
+            if (vk == VK_DELETE)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_DELETE, ScanCode );
+                return 0;
+            }
+            // Home - E0 47  E0 C7  0x47
+            if (vk == VK_HOME) 
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_HOME, ScanCode );
+                return 0;
+            }
+            // End - E0 4F	E0 CF	0x4F
+            if (vk == VK_END)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_END, ScanCode );
+                return 0;
+            }
+            // Page Up - E0 49	E0 C9	0x49
+            if (vk == VK_PAGEUP)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_PAGEUP, ScanCode );
+                return 0;
+            }
+            // Page Down - E0 51	E0 D1	0x51
+            if (vk == VK_PAGEDOWN)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_PAGEDOWN, ScanCode );
+                return 0;
+            }
+            // right ctrl  = make: E0 1D,    break: E0 F0 1D
+            if (vk == VK_RCONTROL)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_RCONTROL, ScanCode );
+                return 0;
+            }
+            // Right Alt / AltGr	E0 38	E0 B8	0x38
+            if (vk == VK_ALTGR)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_ALTGR, ScanCode );
+                return 0;
+            }
+            // SysMenu / App key	E0 5D	E0 DD	0x5D
+            if (vk == VK_APPS)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYDOWN, VK_APPS, ScanCode );
+                return 0;
+            }
+
+            break;
+
+        case MSG_SYSKEYUP:
+        //printk("broker: MSG_SYSKEYUP sc=%d\n",ScanCode);
+
+            // Right ENTER
+            if (vk == VK_RETURN)
+            {
+                if (ctrl_status == TRUE){
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_KEYUP, VK_RETURN, ScanCode );
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_RIGHT)
+            {
+                if (ctrl_status == TRUE){
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_ARROW_RIGHT, ScanCode );
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_UP)
+            {
+                if (ctrl_status == TRUE){
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_ARROW_UP, ScanCode );
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_DOWN)
+            {
+                if (ctrl_status == TRUE){
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_ARROW_DOWN, ScanCode );                    
+                    return 0;
+                }
+            }
+
+            if (vk == VK_ARROW_LEFT)
+            {
+                if (ctrl_status == TRUE){
+                    return 0;
+                } else {
+                    ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_ARROW_LEFT, ScanCode );
+                    return 0;
+                }
+            }
+
+            // Insert - E0 52	E0 D2	0x52
+            if (vk == VK_INSERT)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_INSERT, ScanCode );
+                return 0;
+            }
+            // Delete - E0 53	E0 D3	0x53
+            if (vk == VK_DELETE)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_DELETE, ScanCode );
+                return 0;
+            }
+            // Home - E0 47  E0 C7  0x47
+            if (vk == VK_HOME)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_HOME, ScanCode );
+                return 0;
+            }
+            // End - E0 4F	E0 CF	0x4F
+            if (vk == VK_END)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_END, ScanCode );
+                return 0;
+            }
+            // Page Up - E0 49	E0 C9	0x49
+            if (vk == VK_PAGEUP)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_PAGEUP, ScanCode );
+                return 0;
+            }
+            // Page Down - E0 51	E0 D1	0x51
+            if (vk == VK_PAGEDOWN)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_PAGEDOWN, ScanCode );
+                return 0;
+            }
+
+            // right ctrl  = make: E0 1D,    break: E0 F0 1D
+            if (vk == VK_RCONTROL)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_RCONTROL, ScanCode );
+                return 0;
+            }
+            // Right Alt / AltGr	E0 38	E0 B8	0x38
+            if (vk == VK_ALTGR)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_ALTGR, ScanCode );
+                return 0;
+            }
+
+            // SysMenu / App key	E0 5D	E0 DD	0x5D
+            if (vk == VK_APPS)
+            {
+                ibroker_post_message_to_fg_thread( MSG_SYSKEYUP, VK_APPS, ScanCode );
+                return 0;
+            }
+            break;
+
+        default:
+            break;
+    };
+    return 0;
+
+fail:
+    return (int) -1;
+}
+
+// -------------------------------
+// __consoleProcessKeyboardInput:
+// #bugbug: We don't wanna call the window server. Not now.
+// #important:
+// Isso garante que o usuário sempre podera alterar o foco
+// entre as janelas do kgws usando o teclado, pois essa rotina
+// é independente da thread que está em foreground.
+// #todo
+// Talvez a gente possa usar algo semelhando quando o window
+// server estiver ativo. Mas possivelmente precisaremos 
+// usar outra rotina e não essa. Pois lidaremos com uma estrutura
+// de janela diferente, que esta localizada em ring3.
+// From Windows:
+// Because the mouse, like the keyboard, 
+// must be shared among all the different threads, the OS 
+// must not allow a single thread to monopolize the mouse cursor 
+// by altering its shape or confining it to a small area of the screen.
+// #todo
+// This functions is the moment to check the current input model,
+// and take a decision. It will help us to compose the event message.
+// It is because each environment uses its own event format.
+
+static int 
+__consoleProcessKeyboardInput ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+// Called by wmKeyEvent().
+
+    int Status = -1;
+    char ch_buffer[2];  // char string.
+    char buffer[128];   // string buffer
+    unsigned long tmp_value=0;
+
+
+// Not here
+    if (InputBrokerInfo.shell_flag != TRUE)
+        return -1;
+
+    //debug_print("wmProcedure:\n");
+    ksprintf (buffer,"My \x1b[8C string!\n"); 
+
+// ===================================
+// Control:
+//     'Control + ?' belongs to the kernel.
+
+// ===================================
+// Shift:
+//     'Shift + ?' belongs to the window server.
+
+    // Who is the current virtual console?
+    struct tty_d *target_tty;
+
+//
+// tty
+//
+
+    if (fg_console < 0 || fg_console > 3)
+        panic("__consoleProcessKeyboardInput: fg_console");
+    target_tty = (struct tty_d *) &CONSOLE_TTYS[fg_console];
+    if (target_tty->magic != 1234)
+        panic("__consoleProcessKeyboardInput: target_tty->magic");
+
+//
+// Dispatcher
+//
+
+    if (msg < 0){
+        debug_print("__consoleProcessKeyboardInput: msg\n");
+        return (int) -1;
+    }
+
+    switch (msg){
+
+// No mouse message here. Only keyboard.
+    case MSG_MOUSEMOVE:
+    case MSG_MOUSEPRESSED:
+    case MSG_MOUSERELEASED:
+        return (int) -1;
+        break;
+
+// ==============
+// msg: Keyup
+
+    // Nothing for now
+    //case MSG_KEYUP:
+        //return (int) -1;
+        //break;
+
+// ==============
+// msg: Keydown
+    case MSG_KEYDOWN:
+
+        // Para todas as teclas quando o console não está ativo.
+        // Serão exibidas pelo window server 
+        // na janela com foco de entrada,
+        // Se ela for do tipo editbox.
+        // O ws mandará mensagens para a thread associa
+        // à janela com foco de entrada.
+
+        // Nao proccessaremos keydown 
+        // se nao estivermos em modo shell.
+        if (InputBrokerInfo.shell_flag != TRUE){
+            //return 0;
+        }
+
+        switch (long1){
+
+        case VK_RETURN:
+        //case '\n':
+        //case '\r':
+            //if (InputBrokerInfo.shell_flag != TRUE){
+                //wmSendInputToWindowManager(0,MSG_KEYDOWN,long1,long2);
+                //return 0;
+            //}
+
+            // Let's run the embedded shell in order to compare the strings
+            if (InputBrokerInfo.shell_flag == TRUE)
+            {
+                kinput('\0');  // Finalize the prompt[]
+                // Parse the string in prompt[].
+                ksys_shell_parse_cmdline(prompt,sizeof(prompt));
+                return 0;
+            }
+            break;
+
+         //case 'd':
+         //case 'D':
+         //    if (ctrl_status==TRUE && alt_status==TRUE)
+         //    {
+         //        do_enter_embedded_shell(FALSE);
+         //        return 0;
+         //    }
+         //    break;
+
+        //case VK_TAB: 
+            //printk("TAB\n"); 
+            //break;
+
+        default:
+
+            // Console: Yes, we're using the embedded kernel console.
+            // + Put the char into the prompt[] buffer.
+            // + Print the char into the screen using fg_console.
+            // see: chardev/console/console.c
+            if (InputBrokerInfo.shell_flag == TRUE){
+                consoleInputChar(long1);
+                console_putchar((int) long1, fg_console);
+                return 0;
+            }
+
+            // Not console
+            // NO, we're not using the kernel console.
+            // Pois não queremos que algum aplicativo imprima na tela
+            // enquanto o console virtual está imprimindo.
+            if (InputBrokerInfo.shell_flag != TRUE)
+            {
+
+                // Algumas combinações são enviadas para o display server.
+                // nesse caso precisamos mudar o message code.
+                // -----
+                // Caso nenhuma combinação nos interesse,
+                // então enviaremos teclas de digitação, inclusive 
+                // com shift acionado.
+                // >> Não devemos fazer isso caso algum terminal virtual
+                //    esteja em foreground. Pois nesse caso, enviar 
+                //    as teclas de digitação para stdin ja é o suficiente.
+                // #todo: Podemos criar uma flag que diga se a thread 
+                // é um terminal virtual ou não.
+
+                // ^a = Start OF Header = 1
+                if (ctrl_status == TRUE && long1 == ASCII_SOH)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_SELECT_ALL, long1, long2);
+                    return 0;
+                }
+
+                // ^c = End Of Text = 3
+                if (ctrl_status == TRUE && long1 == ASCII_ETX)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_COPY, long1, long2);
+                    return 0;
+                }
+
+                // ^f = Acknowledgement = 6
+                if (ctrl_status == TRUE && long1 == ASCII_ACK)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_FIND, long1, long2);
+                    return 0;
+                }
+
+                // ^w = End Of Transition Block = 17
+                // Let's close the active window with [control + w]. 
+                if (ctrl_status == TRUE && long1 == ASCII_ETB)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_CLOSE, long1, long2);
+                    return 0;
+                }
+
+                // ^q = Device Control 1 = 0x11
+                if (ctrl_status == TRUE && long1 == ASCII_DC1)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_DC1, long1, long2);                    
+                    return 0;
+                }
+                // ^r = Device Control 2 = 0x12
+                if (ctrl_status == TRUE && long1 == ASCII_DC2)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_DC2, long1, long2);
+                    return 0;
+                }
+                // ^s = Device Control 3 = 0x13
+                // Some apps can use it as SAVE.
+                if (ctrl_status == TRUE && long1 == ASCII_DC3)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_DC3, long1, long2);
+                    return 0;
+                }
+                // ^t = Device Control 4 = 0x14
+                if (ctrl_status == TRUE && long1 == ASCII_DC4)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_DC4, long1, long2);
+                    return 0;
+                }
+
+                // ^v = Synchronous Idle = 22
+                if (ctrl_status == TRUE && long1 == ASCII_SYN)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_PASTE, long1, long2);
+                    return 0;
+                }
+
+                // ^x = Cancel = 24
+                if (ctrl_status == TRUE && long1 == ASCII_CAN)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_CUT, long1, long2);
+                    return 0;
+                }
+
+                // ^z = Substitute - 26
+                if (ctrl_status == TRUE && long1 == ASCII_SUB)
+                {
+                    ibroker_post_message_to_fg_thread(
+                        MSG_UNDO, long1, long2);
+                    return 0;
+                }
+
+                // ...
+
+                // [Teclas de digitação] 
+                // (Inclusive com SHIFT)
+                // Enviando teclas de digitação para o display server.
+                // que está imprimindo na janela do tipo editbox 
+                // com foco de entrada.
+                // Mas ao mesmo tempo, a função wmRawkeyEvent pode ja ter
+                // mandado teclas de digitação para stdin antes de chamar
+                // essa rotina.
+
+                // ?? #bugbug
+                // No caso da combinação não ter sido tratada na rotina acima.
+                // Enviamos combinação de [shift + tecla] de digitaçao.
+                // Teclas de digitaçao sao processadas no tratador de keystrokes.
+
+                // #test
+                // NOT SENDING typing chars to the server for now.
+                // Actually other routine bellow is also sanding it.
+                // ibroker_post_message_to_ds( msg, long1, long2 );
+
+                return 0;
+            }
+            return 0;
+            break;
+        };
+        break;
+
+// ==============
+// msg: Syskeyup
+// liberadas: teclas de funçao
+// syskeyup foi enviado antes pela função que chamou essa função.
+// não existe combinação de tecla de controle e syskeyup.
+    case MSG_SYSKEYUP:
+        // Se nenhum modificador esta acionado,
+        // entao apenas enviamos a tecla de funçao 
+        // para o window server.
+        // Send it to the window server.
+        if( shift_status != TRUE &&
+            ctrl_status != TRUE &&
+            alt_status != TRUE )
+        {
+            return 0;
+        }
+        break;
+
+// ==============
+// msg: Syskeydown
+// Pressionadas: teclas de funçao
+// Se nenhum modificador esta acionado,
+// entao apenas enviamos a tecla de funçao 
+// para o window server.
+// Send it to the window server.
+// #bugbug:
+// Esse tratamento é feito pela rotina que chamou
+// essa rotina. Mas isso também pode ficar aqui.
+        
+    case MSG_SYSKEYDOWN:
+
+        // #??
+        // Não enviamos mensagem caso não seja combinação?
+        if ( shift_status != TRUE && 
+             ctrl_status != TRUE && 
+             alt_status != TRUE )
+        {
+            return 0;
+        }
+
+        // Process a set of combinations.
+        switch (long1){
+
+            // Exibir a surface do console.
+            case VK_F1:
+                if (ctrl_status == TRUE){
+                    // control + shift + F1
+                    // Full ps2 initialization and launch the app.
+                    // #danger: Mouse is not well implemented yet.
+                    if( shift_status == TRUE){
+                        //PS2_initialization();
+                        //do_launch_app_via_initprocess(4001);
+                        return 0;
+                    }
+                    do_launch_app_via_initprocess(4001);  //terminal
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77101, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    jobcontrol_switch_console(0);
+                    //ibroker_post_message_to_ds( (int) 88101, 0, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F2:
+                if (ctrl_status == TRUE){
+                    do_launch_app_via_initprocess(4002);  //editor
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77102, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    jobcontrol_switch_console(1);
+                    //ibroker_post_message_to_ds( (int) 88102, 0, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F3:
+                if (ctrl_status == TRUE){
+                    do_launch_app_via_initprocess(4003);  //doc
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77103, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    jobcontrol_switch_console(2);
+                    //ibroker_post_message_to_ds( (int) 88103, 0, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F4:
+                if (ctrl_status == TRUE){
+                    do_launch_app_via_initprocess(4004);  //#pubterm
+                    return 0;
+                }
+                // alt+f4: The vm handle this combination.
+                // We can't use it on vms.
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77104, 0, 0 );
+                    return 0;
+                }
+                if (shift_status == TRUE){
+                    jobcontrol_switch_console(3);
+                    //ibroker_post_message_to_ds( (int) 88104, 0, 0 );
+                }
+                return 0;
+                break;
+
+            // Reboot
+            case VK_F5:
+                if (ctrl_status == TRUE){
+                    //do_launch_app_via_initprocess(4005);
+                    //ibroker_post_message_to_ds( 33888, 0, 0 ); //#TEST
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77105, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88105, 0, 0 );
+                    //ipc_post_message_to_foreground_thread(
+                    //   ??, 1234, 1234 );
+                }
+                return 0;
+                break;
+
+            // Send a message to the Init process.
+            // 9216 - Launch the redpill application
+            case VK_F6:
+                if (ctrl_status == TRUE){
+                    // do_launch_app_via_initprocess(4006);
+                    return 0; 
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77106, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88106, 0, 0 );
+                }
+                return 0;
+                break;
+
+            // Test 1.
+            case VK_F7:
+                if (ctrl_status == TRUE){
+                    //do_launch_app_via_initprocess(4007);
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77107, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88107, 0, 0 );
+                }
+                return 0;
+                break;
+
+            // Test 2.
+            case VK_F8:
+                if (ctrl_status == TRUE){
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77108, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88108, 0, 0 );
+                    // MSG_HOTKEY=88 | 1 = Hotkey id 1.
+                    ibroker_post_message_to_ds( (int) MSG_HOTKEY, 1, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F9:
+                // Enter ring0 embedded shell
+                if (ctrl_status == TRUE){
+                    do_enter_embedded_shell(FALSE);
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77109, 0, 0 );
+                }
+                // [Shift+F9] - Reboot
+                if (shift_status == TRUE){
+                    do_reboot(0);
+                }
+                return 0;
+                break;
+
+            case VK_F10:
+                // Exit ring0 embedded shell.
+                if (ctrl_status == TRUE){
+                    do_exit_embedded_shell();
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77110, 0, 0 );
+                }
+                if (shift_status == TRUE)
+                {
+                    bg_initialize(COLOR_KERNEL_BACKGROUND,TRUE);
+                    show_slots();   //See: tlib.c
+                    //pages_calc_mem();
+                    //ibroker_post_message_to_ds( (int) 88110, 0, 0 );
+                    //refresh_screen();
+                }
+                return 0;
+                break;
+
+            case VK_F11:
+                // Mostra informaçoes sobre as threads.
+                if (ctrl_status == TRUE){
+                    show_slots();
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77111, 0, 0 );
+                }
+                // [Shift+F11] - Safe reboot
+                if (shift_status == TRUE){
+                   do_reboot(0);
+                }
+                return 0;
+                break;
+
+            case VK_F12:
+                // Mostra informaçoes sobre os processos.
+                if (ctrl_status == TRUE){
+                    show_process_information();
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77112, 0, 0 );
+                }
+
+                // [SHIFT + F12]
+                // Update all windows and show the mouse pointer.
+                // IN: window, msg code, data1, data2.
+                // 88112 is invalid ... we need to send a n less than 100.
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88112, 0, 0 );
+                    ibroker_post_message_to_ds( (int) 75, 0, 0 );
+                }
+                return 0;
+                break;
+
+            default:
+                // nothing
+                return 0;
+            }
+
+// ==============
+    default:
+        return (int) -1;
+        break;
+    };
+
+//unexpected_fail:
+    return (int) -1;
+
+fail:
+    debug_print("__consoleProcessKeyboardInput: fail\n");
+    return (int) -1;
+}
+
+// Process input
+unsigned long 
+ksys_console_process_keyboard_input ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+    unsigned long long_rv = 0;
+    int int_rv=0;
+
+    if (msg<0)
+        goto fail;
+
+    int_rv = (int) __consoleProcessKeyboardInput(msg,long1,long2);
+    long_rv = (unsigned long) (int_rv & 0xFFFFFFFF);
+    return long_rv;
+
+fail:
+    return (unsigned long) long_rv;
+}
+
+// Check if a scancode maps to an extended VK.
+// Uses keymap_extended[] to resolve scancode -> VK.
+// Returns TRUE if the VK is one of the extended keys.
+int is_extended_key(unsigned char scancode)
+{
+    if (keymap_extended == NULL)
+        return FALSE;
+
+    // Resolve scancode into VK using extended keymap
+    unsigned char vk = keymap_extended[scancode];
+
+    switch (vk)
+    {
+        case VK_INSERT:
+        case VK_DELETE:
+        case VK_HOME:
+        case VK_END:
+        case VK_PAGEUP:
+        case VK_PAGEDOWN:
+        case VK_ARROW_UP:
+        case VK_ARROW_DOWN:
+        case VK_ARROW_LEFT:
+        case VK_ARROW_RIGHT:
+        case VK_RCONTROL:
+        case VK_ALTGR:
+        case VK_APPS:
+        //case VK_PAUSEBREAK:  // handled specially, but still extended
+            return TRUE;
+            break;
+    }
+
+    return FALSE;
+}
+
+// Not in console mode
+static int 
+__ProcessKeyboardInput ( 
+    int msg, 
+    unsigned long long1, 
+    unsigned long long2 )
+{
+// Called by wmKeyEvent().
+
+    int Status = -1;
+    char ch_buffer[2];  // char string.
+    char buffer[128];   // string buffer
+    unsigned long tmp_value=0;
+
+// Not here
+    if (InputBrokerInfo.shell_flag == TRUE)
+        return -1;
+
+    //debug_print("wmProcedure:\n");
+    ksprintf (buffer,"My \x1b[8C string!\n"); 
+
+// ===================================
+// Control:
+//     'Control + ?' belongs to the kernel.
+
+// ===================================
+// Shift:
+//     'Shift + ?' belongs to the window server.
+
+    // Who is the current virtual console?
+    struct tty_d *target_tty;
+
+
+//
+// tty
+//
+
+    if (fg_console < 0 || fg_console > 3)
+        panic("__ProcessKeyboardInput: fg_console");
+    target_tty = (struct tty_d *) &CONSOLE_TTYS[fg_console];
+    if (target_tty->magic != 1234)
+        panic("__ProcessKeyboardInput: target_tty->magic");
+
+//
+// Dispatcher
+//
+
+    if (msg < 0){
+        debug_print("__ProcessKeyboardInput: msg\n");
+        return (int) -1;
+    }
+
+    switch (msg){
+
+// No mouse message here. Only keyboard.
+    case MSG_MOUSEMOVE:
+    case MSG_MOUSEPRESSED:
+    case MSG_MOUSERELEASED:
+        return (int) -1;
+        break;
+
+// ==============
+// msg: Keyup
+
+    // Nothing for now
+    //case MSG_KEYUP:
+        //return (int) -1;
+        //break;
+
+// ==============
+// msg: Keydown
+    case MSG_KEYDOWN:
+
+        switch (long1){
+
+        //case VK_RETURN:
+        case '\n':
+        case '\r':
+            break;
+
+         //case 'd':
+         //case 'D':
+         //    if (ctrl_status==TRUE && alt_status==TRUE)
+         //    {
+         //        do_enter_embedded_shell(FALSE);
+         //        return 0;
+         //    }
+         //    break;
+
+        //case VK_TAB: 
+            //printk("TAB\n"); 
+            //break;
+
+        default:
+
+            // Algumas combinações são enviadas para o display server.
+                // nesse caso precisamos mudar o message code.
+                // -----
+                // Caso nenhuma combinação nos interesse,
+                // então enviaremos teclas de digitação, inclusive 
+                // com shift acionado.
+                // >> Não devemos fazer isso caso algum terminal virtual
+                //    esteja em foreground. Pois nesse caso, enviar 
+                //    as teclas de digitação para stdin ja é o suficiente.
+                // #todo: Podemos criar uma flag que diga se a thread 
+                // é um terminal virtual ou não.
+
+            // ^a = Start OF Header = 1
+            if (ctrl_status == TRUE && long1 == ASCII_SOH)
+            {
+                //ibroker_post_message_to_ds( MSG_SELECT_ALL, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_SELECT_ALL, long1, long2);
+                return 0;
+            }
+
+            // ^c = End Of Text = 3
+            if (ctrl_status == TRUE && long1 == ASCII_ETX)
+            {
+                //ibroker_post_message_to_ds( MSG_COPY, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_COPY, long1, long2);
+                return 0;
+            }
+
+            // ^f = Acknowledgement = 6
+            if (ctrl_status == TRUE && long1 == ASCII_ACK)
+            {
+                //ibroker_post_message_to_ds( MSG_FIND, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_FIND, long1, long2);
+
+                return 0;
+            }
+
+            // ^w = End Of Transition Block = 17
+            // Let's close the active window with [control + w]. 
+            if (ctrl_status == TRUE && long1 == ASCII_ETB)
+            {
+                //ibroker_post_message_to_ds( MSG_CLOSE, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_CLOSE, long1, long2);
+                return 0;
+            }
+
+            // ^q = Device Control 1 = 0x11
+            if (ctrl_status == TRUE && long1 == ASCII_DC1)
+            {
+                //ibroker_post_message_to_ds( MSG_DC1, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_DC1, long1, long2);
+
+                return 0;
+            }
+            // ^r = Device Control 2 = 0x12
+            if (ctrl_status == TRUE && long1 == ASCII_DC2)
+            {
+                //ibroker_post_message_to_ds( MSG_DC2, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_DC2, long1, long2);
+
+                return 0;
+            }
+            // ^s = Device Control 3 = 0x13
+            // Some apps can use it as SAVE.
+            if (ctrl_status == TRUE && long1 == ASCII_DC3)
+            {
+                //ibroker_post_message_to_ds( MSG_DC3, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_DC3, long1, long2);
+
+                return 0;
+            }
+            // ^t = Device Control 4 = 0x14
+            if (ctrl_status == TRUE && long1 == ASCII_DC4)
+            {
+                //ibroker_post_message_to_ds( MSG_DC4, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_DC4, long1, long2);
+                return 0;
+            }
+
+                // ^v = Synchronous Idle = 22
+            if (ctrl_status == TRUE && long1 == ASCII_SYN)
+            {
+                //ibroker_post_message_to_ds( MSG_PASTE, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_PASTE, long1, long2);
+
+                return 0;
+            }
+
+            // ^x = Cancel = 24
+            if (ctrl_status == TRUE && long1 == ASCII_CAN)
+            {
+                //ibroker_post_message_to_ds( MSG_CUT, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_CUT, long1, long2);
+                return 0;
+            }
+
+            // ^z = Substitute - 26
+            if (ctrl_status == TRUE && long1 == ASCII_SUB)
+            {
+                //ibroker_post_message_to_ds( MSG_UNDO, long1, long2 );
+                ibroker_post_message_to_fg_thread(
+                    MSG_UNDO, long1, long2);
+                return 0;
+            }
+
+                // ...
+
+                // [Teclas de digitação] 
+                // (Inclusive com SHIFT)
+                // Enviando teclas de digitação para o display server.
+                // que está imprimindo na janela do tipo editbox 
+                // com foco de entrada.
+                // Mas ao mesmo tempo, a função wmRawkeyEvent pode ja ter
+                // mandado teclas de digitação para stdin antes de chamar
+                // essa rotina.
+
+                // ?? #bugbug
+                // No caso da combinação não ter sido tratada na rotina acima.
+                // Enviamos combinação de [shift + tecla] de digitaçao.
+                // Teclas de digitaçao sao processadas no tratador de keystrokes.
+
+                // #test
+                // NOT SENDING typing chars to the server for now.
+                // Actually other routine bellow is also sanding it.
+                // ibroker_post_message_to_ds( msg, long1, long2 )
+
+            //debug_print ("wmProcedure: done\n");
+            return 0;
+            break;
+        };
+        break;
+
+// ==============
+// msg: Syskeyup
+// liberadas: teclas de funçao
+// syskeyup foi enviado antes pela função que chamou essa função.
+// não existe combinação de tecla de controle e syskeyup.
+    case MSG_SYSKEYUP:
+        // Se nenhum modificador esta acionado,
+        // entao apenas enviamos a tecla de funçao 
+        // para o window server.
+        // Send it to the window server.
+        if( shift_status != TRUE &&
+            ctrl_status != TRUE &&
+            alt_status != TRUE )
+        {
+            return 0;
+        }
+        break;
+
+// ==============
+// msg: Syskeydown
+// Pressionadas: teclas de funçao
+// Se nenhum modificador esta acionado,
+// entao apenas enviamos a tecla de funçao 
+// para o window server.
+// Send it to the window server.
+// #bugbug:
+// Esse tratamento é feito pela rotina que chamou
+// essa rotina. Mas isso também pode ficar aqui.
+        
+    case MSG_SYSKEYDOWN:
+
+        // #??
+        // Não enviamos mensagem caso não seja combinação?
+        if ( shift_status != TRUE && 
+             ctrl_status != TRUE && 
+             alt_status != TRUE )
+        {
+            return 0;
+        }
+
+        // Process a set of combinations.
+        switch (long1){
+
+            // Exibir a surface do console.
+            case VK_F1:
+                if (ctrl_status == TRUE){
+                    // control + shift + F1
+                    // Full ps2 initialization and launch the app.
+                    // #danger: Mouse is not well implemented yet.
+                    if( shift_status == TRUE){
+                        //PS2_initialization();
+                        //do_launch_app_via_initprocess(4001);
+                        return 0;
+                    }
+                    do_launch_app_via_initprocess(4001);  //terminal
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77101, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //do_enter_embedded_shell(FALSE);
+                    jobcontrol_switch_console(0);
+                    //ibroker_post_message_to_ds( (int) 88101, 0, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F2:
+                if (ctrl_status == TRUE){
+                    do_launch_app_via_initprocess(4002);  //editor
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77102, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //do_enter_embedded_shell(FALSE);
+                    jobcontrol_switch_console(1);
+                    //ibroker_post_message_to_ds( (int) 88102, 0, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F3:
+                if (ctrl_status == TRUE){
+                    do_launch_app_via_initprocess(4003);  //doc
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77103, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //do_enter_embedded_shell(FALSE);
+                    jobcontrol_switch_console(2);
+                    //ibroker_post_message_to_ds( (int) 88103, 0, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F4:
+                if (ctrl_status == TRUE){
+                    do_launch_app_via_initprocess(4004);  //#pubterm
+                    return 0;
+                }
+                // alt+f4: The vm handle this combination.
+                // We can't use it on vms.
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77104, 0, 0 );
+                    return 0;
+                }
+                if (shift_status == TRUE){
+                    //do_enter_embedded_shell(FALSE);
+                    jobcontrol_switch_console(3);
+                    //ibroker_post_message_to_ds( (int) 88104, 0, 0 );
+                }
+                return 0;
+                break;
+
+            // Reboot
+            case VK_F5:
+                if (ctrl_status == TRUE){
+                    //do_launch_app_via_initprocess(4005);
+                    //ibroker_post_message_to_ds( 33888, 0, 0 ); //#TEST
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77105, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88105, 0, 0 );
+                    //ipc_post_message_to_foreground_thread(
+                    //   ??, 1234, 1234 );
+                }
+                return 0;
+                break;
+
+            // Send a message to the Init process.
+            // 9216 - Launch the redpill application
+            case VK_F6:
+                if (ctrl_status == TRUE){
+                    // do_launch_app_via_initprocess(4006);
+                    return 0; 
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77106, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88106, 0, 0 );
+                }
+                return 0;
+                break;
+
+            // Test 1.
+            case VK_F7:
+                if (ctrl_status == TRUE){
+                    //do_launch_app_via_initprocess(4007);
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77107, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88107, 0, 0 );
+                }
+                return 0;
+                break;
+
+            // Test 2.
+            case VK_F8:
+                if (ctrl_status == TRUE){
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77108, 0, 0 );
+                }
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88108, 0, 0 );
+                    // MSG_HOTKEY=88 | 1 = Hotkey id 1.
+                    ibroker_post_message_to_ds( (int) MSG_HOTKEY, 1, 0 );
+                }
+                return 0;
+                break;
+
+            case VK_F9:
+                // Enter ring0 embedded shell
+                if (ctrl_status == TRUE){
+                    do_enter_embedded_shell(FALSE);
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77109, 0, 0 );
+                }
+                // [Shift+F9] - Reboot
+                if (shift_status == TRUE){
+                    do_reboot(0);
+                }
+                return 0;
+                break;
+
+            case VK_F10:
+                // Exit ring0 embedded shell.
+                if (ctrl_status == TRUE){
+                    do_exit_embedded_shell();
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77110, 0, 0 );
+                }
+                if (shift_status == TRUE)
+                {
+                    bg_initialize(COLOR_KERNEL_BACKGROUND,TRUE);
+                    show_slots();   //See: tlib.c
+                    //pages_calc_mem();
+                    //ibroker_post_message_to_ds( (int) 88110, 0, 0 );
+                    //refresh_screen();
+                }
+                return 0;
+                break;
+
+            case VK_F11:
+                // Mostra informaçoes sobre as threads.
+                if (ctrl_status == TRUE){
+                    show_slots();
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77111, 0, 0 );
+                }
+                // [Shift+F11] - Safe reboot
+                if (shift_status == TRUE){
+                   do_reboot(0);
+                }
+                return 0;
+                break;
+
+            case VK_F12:
+                // Mostra informaçoes sobre os processos.
+                if (ctrl_status == TRUE){
+                    show_process_information();
+                    return 0;
+                }
+                if (alt_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 77112, 0, 0 );
+                }
+
+                // [SHIFT + F12]
+                // Update all windows and show the mouse pointer.
+                // IN: window, msg code, data1, data2.
+                if (shift_status == TRUE){
+                    //ibroker_post_message_to_ds( (int) 88112, 0, 0 );
+                    ibroker_post_message_to_ds( (int) 75, 0, 0 );
+                }
+                return 0;
+                break;
+
+            default:
+                // nothing
+                return 0;
+            }
+
+// ==============
+    default:
+        return (int) -1;
+        break;
+    };
+
+//unexpected_fail:
+    return (int) -1;
+
+fail:
+    debug_print("__ProcessKeyboardInput: fail\n");
+    return (int) -1;
+}
+
+// ----------------------------------------------
+// wmRawKeyEvent:
+// This is basically the low level support for the
+// ps2 keyboard on Gramado OS.
+// We are called from the embedded ps2 keyboard device driver.
+// :: We are called, we do not read data from a file provided
+// by the device driver.
+// We post the message into the stdin file and into the
+// control thread of the Window Server and sometimes
+// we process the input before sending a message.
+// ----------------------------------------------
+// Envia uma mensagem de teclado para a janela com o 
+// foco de entrada.
+// Called by DeviceInterface_PS2Keyboard in ps2kbd.c
+// Pega um scancode, transforma em caractere e envia 
+// na forma de mensagem para a thread de controle associada 
+// com a janela que tem o foco de entrada.
+// #todo
+// #importante
+// Precisa conferir ke0 antes de construir a mensagem,
+// para assim usar o array certo. ke0 indica o teclado estendido.
+// #todo
+// Na verdade é 'translate' and 'dispatch'.
+// Cria o evento usando o rawbyte, traduz o raw byte para ascii,
+// e por fim envia para o buffer da tty de teclado e para
+// a thread do processo em foreground. Tudo depende do input mode.
+// Called by the kdb device driver in ps2kbd.c.
+// Is this the forground thread?
+// #bugbug: Não estamos usando o parâmetro tid.
+// Lembrando que numa interrupção de teclado,
+// não temos o contexto salvo. Então não podemos chamar o
+// scheduler. Mas podemos acionar uma flag
+// que de alguma direção para o escalonador.
+// Pega um scancode, transforma em caractere e envia na forma de mensagem
+// para a thread de controle associada com a janela que tem o foco de entrada.
+// + Build the message and send it to the thread's queue.
+// This routine will select the target thread.
+// + Or send the message to the input TTY.
+// This way the foreground process is able to get this data.
+// See: ps2kbd.c
+// See: console.c
+// IN: 
+// device type, data.
+// 1 = keyboard
+// Call the event handler.
+// Console interrupt
+// Valid foreground thread.
+// Handler for keyboard input.
+// See: chardev/display/kgwm.c
+// ##
+// Nesse caso o driver esta chamando a rotina
+// que lida com o evento. Mas o plano é apenas
+// colocar os eventos de teclado em um arquivo
+// que poderá ser aberto e lido pelo window server.
+// In wmRawKeyEvent, if not in the embedded shell and 
+// it’s a regular keydown, the ASCII byte is fed to stdin.
+// IN:
+// target thread, raw byte 
+
+// Destinations
+// Display server (DS) - for GUI/window management.
+// Foreground app      - for application-level input.
+
+// Foreground apps like (VT) should receive almost all keystrokes, 
+// including control combinations.
+// Display server should only receive global/system-level events 
+// (like focus changes or hotkeys that affect the whole GUI).
+
+// Called by DeviceInterface_PS2Keyboard() in ps2kbd.c.
+// Right after the ps2 keyboard interrupt handler.
+// Post keyboard event to the current foreground thread.
+
+int 
+wmRawKeyEvent( 
+    unsigned char raw_byte_0,
+    unsigned char raw_byte_1,
+    unsigned char raw_byte_2,
+    unsigned char raw_prefix )
+{
+    // Saving the values into a structure for future use.
+    struct keyboard_raw_data_d raw_data;
+    raw_data.raw0   = (unsigned char) raw_byte_0;
+    raw_data.raw1   = (unsigned char) raw_byte_1;
+    raw_data.raw2   = (unsigned char) raw_byte_2;
+    raw_data.prefix = (unsigned char) raw_prefix;
+
+// Who is the current virtual console?
+    struct tty_d *target_tty;
+
+// Flag for the moment were a key is released
+    int fBreak = FALSE;
+
+// #bugbug
+// Sometimes we're sending data to multiple targets.
+// Maybe its gonna depend on the input mode.
+
+    unsigned char __sc = (raw_data.raw0 & KEYBOARD_KEY_MASK);
+    int Prefix = (int) (raw_data.prefix & 0xFF);
+
+// Prefix 0x00 ?
+// For normal keys and
+// For extended keys in Virtualbox, that doesn't use prefix.
+// Let's check if it is extended keys and fake the prefix for 
+// the use in the rest of the routine.
+
+    // Is it extended key?
+    int isExtendedKey = FALSE;
+    if (Prefix == 0xE0)
+        isExtendedKey = TRUE;
+    if (Prefix == 0xE1)
+        isExtendedKey = TRUE;
+// #hack
+// It's because Virtualbox is fancy enough to send 
+// an extended keyboard value without a prefix.
+    if (Prefix == 0x00)
+    {
+        isExtendedKey = FALSE;
+        isExtendedKey = (int) is_extended_key(__sc);
+
+        if (isExtendedKey == TRUE)
+        {
+            // Fake the raw values for the rest of this routine
+            raw_data.raw0 = 0xE0;         // The raw0 is the prefix now
+            raw_data.raw1 = raw_byte_0;   // The key didn't have a prefix.
+            raw_data.raw2 = raw_byte_1;
+    
+            // Fake the prefix for the rest of this routine
+            raw_data.prefix = 0xE0;
+            Prefix = 0xE0;
+        }
+
+        // Special case. 
+        // Its saying that its and extended key with the prefix 0x00.
+        // QEMU / KVM / Bochs (and real hardware): uses prefixes
+        // VirtualBox: Often flattens extended keys, dropping the 0xE0 prefix.
+        // #ps: In Gramado right control is not extended
+        // when the prefix is 0x00. (prefix 0x00 is an anomally.)
+        unsigned char _vk = keymap_extended[__sc];
+        if (_vk == VK_LCONTROL ||  _vk == VK_RCONTROL)
+        {
+            isExtendedKey = FALSE;
+                
+            raw_data.raw0 = raw_byte_0;         // The raw0 is the prefix now
+            raw_data.raw1 = raw_byte_1;   // The key didn't have a prefix.
+            raw_data.raw2 = raw_byte_2;
+            
+            raw_data.prefix = 0x00;
+            Prefix = 0x00;
+        }
+    }
+
+// Step 0 
+// Declarações de variáveis.
+
+    //struct te_d  *__p;
+    //struct thread_d   *t;
+
+    //unsigned long status = 0;
+    //int msg_status = -1;
+    //int save_pos = 0;
+
+// Pegando o argumento e convertendo para ascii
+    unsigned char Keyboard_RawByte  =0;
+    unsigned char Keyboard_ScanCode =0;    // The scancode.
+
+//==============
+// [event block]
+    //struct input_block_d input_block;
+    int           Event_Message       = 0;  //arg2 - message number
+    unsigned long Event_LongVK        = 0;  //arg3 - vk
+    unsigned long Event_LongRawByte   = 0;  //arg4 - raw byte
+    unsigned long Event_LongScanCode  = 0;  //arg4 - raw byte
+    //===================
+
+    int Status = -1;
+
+// No keyborad device can send us input event.
+    if (system_state != SYSTEM_RUNNING)
+        goto fail;
+
+//
+// tty
+//
+
+    if (fg_console < 0 || fg_console > 3)
+        panic("wmRawKeyEvent: fg_console");
+    target_tty = (struct tty_d *) &CONSOLE_TTYS[fg_console];
+    if (target_tty->magic != 1234)
+        panic("wmRawKeyEvent: target_tty->magic");
+
+// #test
+// Not working yet.
+    //struct thread_d *input_thread;
+    //input_thread = (struct thread_d *) threadList[tid];
+    //input_thread->quantum = 20;
+
+//#todo
+    //debug_print("xxxKeyEvent:\n");
+
+    //if (tid<0 || tid >= THREAD_COUNT_MAX)
+    //{
+    //    debug_print("wmKeyEvent: tid\n");
+    //    return (int) (-1);
+    //}
+
+// =============
+// Step1
+// Pegar o RawByte.
+// O driver pegou o scancode e passou para a disciplina de linha 
+// através de parâmetro.
+
+    Keyboard_RawByte = raw_data.raw0;
+    if (isExtendedKey == TRUE)
+        Keyboard_RawByte = raw_data.raw1;
+
+    if (Keyboard_RawByte == 0xFF){
+        goto fail;
+    }
+
+// ================================================
+// Make or Break?
+// Um bit sinaliza o break, 
+// que representa que a tecla foi liberada.
+
+    // Released: Yes, it's a break.
+    if ( (Keyboard_RawByte & BREAK_MASK) != 0 ){
+        fBreak = TRUE;
+    }
+    // Pressed: It's not a break, it's a make.
+    if ( (Keyboard_RawByte & BREAK_MASK) == 0 ){
+        fBreak = FALSE;
+    }
+
+// ================================================
+// Released: Yes, it's a break.
+
+    if (fBreak == TRUE && isExtendedKey == FALSE)
+    {
+        //Keyboard_ScanCode = Keyboard_RawByte;
+        Keyboard_ScanCode = raw_byte_0;
+
+        // Clear the parity bit
+        Keyboard_ScanCode &= KEYBOARD_KEY_MASK;
+
+        unsigned char vk0 = keymap_normal[Keyboard_ScanCode];
+
+        switch (vk0)
+        {
+
+            // Shift released
+            case VK_LSHIFT:
+            case VK_RSHIFT:
+                shift_status = FALSE;  
+                Event_Message = MSG_SYSKEYUP;
+                break;
+
+            // Control released
+            case VK_LCONTROL:
+            case VK_RCONTROL:
+                //printk("VK_LCONTROL up\n");
+                ctrl_status = FALSE;  
+                Event_Message = MSG_SYSKEYUP;
+                break;
+
+            // Winkey released.
+            case VK_LWIN:
+            case VK_RWIN:
+                winkey_status = FALSE;
+                Event_Message = MSG_SYSKEYUP;
+                break;
+                
+            // Alt released
+            case VK_LALT:  //case VK_LMENU:
+            //case VK_RMENU:
+                alt_status = FALSE;  
+                Event_Message = MSG_SYSKEYUP;
+                break;
+
+            // Control menu.
+            // Application menu.
+            case VK_APPS:  //case VK_CONTROL_MENU:
+                //controlmenu_status = 0; //#todo
+                Event_Message = MSG_SYSKEYUP;
+                break;
+
+            // Funções liberadas.
+            case VK_F1: 
+            case VK_F2: 
+            case VK_F3: 
+            case VK_F4:
+            case VK_F5: 
+            case VK_F6: 
+            case VK_F7: 
+            case VK_F8:
+            case VK_F9: 
+            case VK_F10: 
+            case VK_F11: 
+            case VK_F12:
+                Event_Message = MSG_SYSKEYUP;
+                break;
+
+            // Not a system key,
+            // just a regular keyup.
+            default:
+                Event_Message = MSG_KEYUP;
+                break;
+        };
+
+        // ----------------------
+        // Analiza: 
+        // Se for do sistema usa o mapa de caracteres apropriado. 
+        // Normal.
+        
+        if (Event_Message == MSG_SYSKEYUP)
+        {
+            // se liberada teclas de sistema como capslock ligado
+            if (capslock_status == FALSE)
+            { Event_LongVK = keymap_normal[Keyboard_ScanCode];   goto done; }
+            // se liberada teclas de sistema como capslock desligado
+            if (capslock_status == TRUE)
+            { Event_LongVK = keymap_shift[Keyboard_ScanCode]; goto done; }
+            // ...
+        }
+
+        // Analiza: 
+        // Se for tecla normal, pega o mapa de caracteres apropriado.
+        // minúscula
+        // Nenhuma tecla de modificação ligada.
+
+        // #bugbug: some chars are not working
+        // for keymap_shift[]
+        // See: kbdabnt2.h
+        if (Event_Message == MSG_KEYUP)
+        {
+            // Minúsculas.
+            if (capslock_status == FALSE)
+            { Event_LongVK = keymap_normal[Keyboard_ScanCode];   goto done; }
+            // Maiúsculas.
+            if (capslock_status == TRUE)
+            { Event_LongVK = keymap_shift[Keyboard_ScanCode]; goto done; }
+            // ...
+        }
+
+        // Nothing
+        goto done;
+    }
+
+// ================================================
+// Pressed: It's not a break, it's a make.
+
+    if (fBreak != TRUE && isExtendedKey == FALSE)
+    {
+        //Keyboard_ScanCode = Keyboard_RawByte;
+        Keyboard_ScanCode = raw_byte_0;
+        // Clear the parity bit
+        Keyboard_ScanCode &= KEYBOARD_KEY_MASK; 
+
+        unsigned char vk1 = keymap_normal[Keyboard_ScanCode];
+
+        switch (vk1)
+        {
+            // Shift pressed
+            case VK_LSHIFT:
+            case VK_RSHIFT:
+                shift_status = TRUE;
+                Event_Message = MSG_SYSKEYDOWN;
+                break;
+
+            // Control pressed
+            case VK_LCONTROL:
+            case VK_RCONTROL:
+                //printk("VK_LCONTROL down\n");
+                ctrl_status = TRUE;
+                Event_Message = MSG_SYSKEYDOWN;
+                break;
+
+            // Winkey pressed
+            case VK_LWIN:
+            case VK_RWIN:
+                winkey_status = TRUE; 
+                Event_Message = MSG_SYSKEYDOWN;
+                break;
+
+            // Left alt pressed
+            case VK_LALT:
+                alt_status = TRUE;
+                Event_Message = MSG_SYSKEYDOWN;
+                break;
+
+            // back space será tratado como tecla normal
+
+            // #todo: tab,
+            // tab será tratado como tecla normal por enquanto.
+
+            // caps lock keydown
+            // muda o status do capslock não importa o anterior.
+            case VK_CAPSLOCK:
+                if (capslock_status == FALSE){ 
+                    capslock_status = TRUE; 
+                    Event_Message = MSG_SYSKEYDOWN; 
+                    //ps2kbd_led_status ^= KBD_LEDS_CAPSBIT;
+                    break; 
+                }
+                if (capslock_status == TRUE){ 
+                    capslock_status = FALSE; 
+                    Event_Message = MSG_SYSKEYDOWN; 
+                    //ps2kbd_led_status ^= KBD_LEDS_CAPSBIT;
+                    break; 
+                }
+                break; 
+
+            // num Lock.
+            // Muda o status do numlock não importa o anterior.
+            case VK_NUMLOCK:
+                if (numlock_status == FALSE){
+                    numlock_status = TRUE;
+                    Event_Message = MSG_SYSKEYDOWN;
+                    //ps2kbd_led_status ^= KBD_LEDS_NUMSBIT;
+                    break;
+                }
+                if (numlock_status == TRUE){ 
+                    numlock_status = FALSE;
+                    Event_Message = MSG_SYSKEYDOWN; 
+                    //ps2kbd_led_status ^= KBD_LEDS_NUMSBIT;
+                    break; 
+                }
+                break;
+
+            // Scroll Lock.
+            // Muda o status do numlock não importa o anterior.
+            case VK_SCROLLLOCK:  //case VK_SCROLL:
+                if (scrolllock_status == FALSE){  
+                    scrolllock_status = TRUE;
+                    Event_Message = MSG_SYSKEYDOWN;
+                    //ps2kbd_led_status ^= KBD_LEDS_SCRLBIT;
+                    break;
+                }
+                if (scrolllock_status == TRUE){ 
+                    scrolllock_status = FALSE;
+                    Event_Message = MSG_SYSKEYDOWN; 
+                    //ps2kbd_led_status ^= KBD_LEDS_SCRLBIT;
+                    break; 
+                }
+                break;
+
+            // Funções pressionadas.
+            case VK_F1: 
+            case VK_F2: 
+            case VK_F3: 
+            case VK_F4:
+            case VK_F5: 
+            case VK_F6: 
+            case VK_F7: 
+            case VK_F8:
+            case VK_F9: 
+            case VK_F10: 
+            case VK_F11: 
+            case VK_F12:
+                Event_Message = MSG_SYSKEYDOWN;
+                break;
+
+            // Not a system key,
+            // just a regular keydown.
+            default:
+                Event_Message = MSG_KEYDOWN;
+                break;
+        };
+
+        // ----------------------
+        // Teclas de sistema
+        // Uma tecla do sistema foi pressionada ou liberada.
+        if (Event_Message == MSG_SYSKEYDOWN)
+        {   
+            // se pressionamos teclas de sistema como capslock ligado
+            if (capslock_status == FALSE)
+            { Event_LongVK = keymap_normal[Keyboard_ScanCode];   goto done; }
+            // se pressionamos teclas de sistema como capslock desligado
+            if (capslock_status == TRUE || shift_status == TRUE)
+            { Event_LongVK = keymap_shift[Keyboard_ScanCode]; goto done; }
+            // ...
+        }
+
+        // ----------------------
+        // Teclas de digitaçao
+        // Uma tecla normal foi pressionada ou liberada
+        // mensagem de digitação.
+        if (Event_Message == MSG_KEYDOWN)
+        {
+            // Minúsculas.
+            if (capslock_status == FALSE && shift_status == FALSE)
+            { 
+                Event_LongVK = keymap_normal[Keyboard_ScanCode];
+
+                // #test
+                // We send a combination event,
+                // and the ascii char.
+                // For stdin we send just the ascii char.
+                if (ctrl_status == TRUE)
+                    Event_LongVK = keymap_ctrl[Keyboard_ScanCode];
+
+                goto done; 
+            }
+            // Maiúsculas.
+            if (capslock_status == TRUE || shift_status == TRUE)
+            {
+                Event_LongVK = keymap_shift[Keyboard_ScanCode];
+
+                // #test
+                // We send a combination event,
+                // and the ascii char.
+                // For stdin we send just the ascii char.
+                if (ctrl_status == TRUE)
+                    Event_LongVK = keymap_ctrl[Keyboard_ScanCode];
+
+                goto done;
+            }
+            
+            // ...
+        }
+
+        // Nothing
+        goto done;
+    }
+
+//
+// == Dispatch ========
+//
+
+// Done
+// Para finalizar, vamos enviar a mensagem para fila certa.
+// Fixing the rawbyte to fit in the message arg.
+
+done:
+
+    Event_LongRawByte  = (unsigned long) (Keyboard_RawByte  & 0x000000FF);
+    Event_LongScanCode = (unsigned long) (Event_LongRawByte & 0x0000007F);
+
+    //printk("raw=%d sc=%d\n",Event_LongRawByte,Event_LongScanCode);
+
+// ------------------------------------
+// It's an extended keyboard key.
+// Send combination keys to the display server.
+// #todo: 
+// Extended-key prefix handling must happen 
+// before you reject zero-mapped scancodes.
+
+    int fPause = FALSE;
+    int is_break = FALSE;
+
+    // Pause make (press): E1 1D 45
+    if ( raw_data.raw0 == 0xE1 && 
+         raw_data.raw1 == 0x1D && 
+         raw_data.raw2 == 0x45)
+    {
+        Event_Message = MSG_SYSKEYDOWN;
+        Event_LongVK = VK_PAUSEBREAK;
+        Event_LongRawByte = 0;
+        fPause = TRUE;
+    }
+    // Pause break (release): E1 9D C5
+    if (
+         raw_data.raw0 == 0xE1 && 
+         raw_data.raw1 == 0x9D && 
+         raw_data.raw2 == 0xC5)
+    {
+        Event_Message = MSG_SYSKEYUP;
+        Event_LongVK = VK_PAUSEBREAK;
+        Event_LongRawByte = 0;
+        fPause = TRUE;
+    }
+
+// For extended keys the raw byte is not the first anymore.
+// Lets check the is_break condition against the second byte now.
+    if (Prefix == 0xE0 || Prefix== 0xE1)
+    {
+        // Not a pause/break key
+        if (fPause != TRUE)
+        {
+            is_break = ( raw_data.raw1 & 0x80) ? TRUE : FALSE;
+            if (is_break == TRUE){
+                Event_Message = MSG_SYSKEYUP;
+            } else {
+                Event_Message = MSG_SYSKEYDOWN;
+            }
+            Event_LongRawByte  =  raw_data.raw1;
+            Event_LongScanCode = (unsigned long) ( raw_data.raw1 & 0x0000007F);
+            // Get the vk from the kbdmap for extended keyboards
+            Event_LongVK       = keymap_extended[Event_LongScanCode]; 
+        }
+
+        // #debug
+        //printk("Before: pref=%x rc={%x} sc={%x} vk={%x}\n", 
+            //Prefix, Event_LongRawByte, Event_LongScanCode, Event_LongVK );
+
+        Status = 
+            (int) __ProcessExtendedKeyboardKeyStroke(
+                (int) Prefix,
+                (int) Event_Message, 
+                (unsigned long) Event_LongVK,
+                (unsigned long) Event_LongRawByte,
+                (unsigned long) Event_LongScanCode );
+        return (int) Status;
+    }
+
+    // #debug
+    //printk("Prefix=%d vk={%x} rc={%x} sc={%x}\n", 
+        //Prefix, Event_LongVK, Event_LongRawByte, Event_LongScanCode );
+
+/*
+// #todo
+// This orutine is working fine for Virtualbox ...
+// But its a message. We need some elegant solution.
+// #ps: Virtualbox do not use the right prefix in the case of 
+// extended keyboard ... the prefix is 0.
+// ++
+// ========================================================
+// #hackhack
+// Extended keyboard for Virtualbox
+
+    int vb_fPause = FALSE;
+    int vb_is_break = FALSE;
+
+    int           vb_Prefix = 0;
+    int           vb_Event_Message      = 0;  //arg2 - message number
+    unsigned long vb_Event_LongVK       = 0;  //arg3 - vk
+    unsigned long vb_Event_LongRawByte  = 0;  //arg4 - raw byte
+    unsigned long vb_Event_LongScanCode = 0;  //arg4 - raw byte
+
+    // Pause make (press): E1 1D 45
+    if (raw_byte_1 == 0x1D && raw_byte_2 == 0x45)
+    {
+        vb_Event_Message = MSG_SYSKEYDOWN;
+        vb_Event_LongVK = VK_PAUSEBREAK;
+        vb_Event_LongRawByte = 0;
+        vb_fPause = TRUE;
+    }
+    // Pause break (release): E1 9D C5
+    if (raw_byte_1 == 0x9D && raw_byte_2 == 0xC5)
+    {
+        vb_Event_Message = MSG_SYSKEYUP;
+        vb_Event_LongVK = VK_PAUSEBREAK;
+        vb_Event_LongRawByte = 0;
+        vb_fPause = TRUE;
+    }
+
+    // Not a pause/break key
+    // In the context of virtuabox
+    if (vb_fPause != TRUE)
+    {
+        vb_is_break = (raw_byte_1 & 0x80) ? TRUE : FALSE;
+        if (vb_is_break == TRUE){
+            vb_Event_Message = MSG_SYSKEYUP;
+        } else {
+            vb_Event_Message = MSG_SYSKEYDOWN;
+        }
+        vb_Event_LongRawByte  = raw_byte_1;
+        vb_Event_LongScanCode = (unsigned long) (raw_byte_1 & 0x0000007F);
+        // Get the vk from the kbdmap for extended keyboards
+        vb_Event_LongVK       = keymap_extended[vb_Event_LongScanCode]; 
+    }
+
+    Status = 
+        (int) __ProcessExtendedKeyboardKeyStroke(
+            (int) 0xE0,
+            (int) vb_Event_Message, 
+            (unsigned long) vb_Event_LongVK,
+            (unsigned long) vb_Event_LongRawByte,
+            (unsigned long) vb_Event_LongScanCode );
+// ===============================================================
+// --
+*/
+
+
+// Unmapped scancode
+// It's ok to simply return
+    if (Event_LongVK == 0)
+    {
+        return 0;
+    }
+
+// ==================================
+// Coloca no arquivo stdin.
+// Envia para a thread de controle do window server.
+// Colocamos no arquivo somente se não estivermos no modo console.
+// Coloca no arquivo stdin.
+// Somente ascii.
+// #todo: Nesse caso da pra enviar os primeiros ascii
+// que representam comandos.
+// Nenhuma tecla de controle esta acionada,
+// então vamos colocar a tecla no arquivo de input.
+// Somente keydown. (make).
+// Envia para a thread de controle do window server.
+// Todo tipo de tecla.
+// Se uma tecla de controle estiver acionada,
+// então não mandamos o evento para a thread,
+// pois vamos chamar o procedimento local e
+// considerarmos a combinação de teclas, 
+// antes de enviarmos o evento.
+// O estado de capslock não importa aqui.
+// see: kstdio.c for kstdio_feed_stdin.
+
+// ASCII Codes (0x00~0x7F)
+// Extended ASCII Codes (0x80~0xFF)
+
+    // ASCII for the tty system 
+    int __int_ASCII = (int) (Event_LongVK & 0xFF);
+
+    // Converting RETURN to LF for the tty system.  
+    if (Event_LongVK == VK_RETURN)
+        __int_ASCII = ASCII_LF;  // Line Feed
+
+    int wbytes = 0;  //written bytes.
+
+// ==========================================
+// Inside the embedded shell.
+// Process and return.
+// 1. Embedded shell takes priority
+    if (InputBrokerInfo.shell_flag == TRUE)
+    {
+        Status = 
+            (int) __consoleProcessKeyboardInput(
+                  (int) Event_Message,
+                  (unsigned long) Event_LongVK,
+                  (unsigned long) Event_LongScanCode );
+
+        return (int) Status;
+    }
+
+// ==========================================
+// Not in the embedded shell.
+// Dispatch!
+
+// Is it a combination of not?
+    int isCombination = FALSE;
+    // It is a combination
+    if ( alt_status == TRUE || ctrl_status == TRUE || shift_status == TRUE )
+    {
+        isCombination = TRUE;
+    }
+    // It is not a combination. (not necessary)
+    //if ( alt_status != TRUE && ctrl_status != TRUE && shift_status != TRUE )
+    //{
+        //isCombination = TRUE;
+    //}
+
+// ------------------------------
+// Process the event using the system's window procedures.
+// It can use the kernel's virtual console or
+// send the event to the loadable window server.
+// See: kgwm.c
+// ##
+// Acho que esses são os aceleradores de teclado.
+// Então essa rotina somente será chamada se 
+// os aceleradores de teclado estiverem habilitados.
+// #todo
+// precisamos de uma flag que indique que isso deve ser feito.
+
+// Uma flag global poderia nos dizer se devemos ou não
+// processar algumas combinações. Mas o sistema deve
+// sim processar algumas combinações, independente dos aplicativos.
+// Como a chamada aos consoles do kernel ou control+alt+del.
+
+    // #todo
+    // When we don't need to process the input?
+
+// Process input outside the kernel console.
+// :: keystrokes when we are in ring0 shell mode.
+// queue:: (combinations)
+// #bugbug
+// Here we're outside the console, so we need to call another worker.
+
+// ===================================
+// Combinations
+// 2. Process combinations internally (Ctrl, Alt, Shift)
+    //if ( alt_status == TRUE || ctrl_status == TRUE || shift_status == TRUE )
+    if  (isCombination == TRUE)
+    {
+        Status = 
+            (int) __ProcessKeyboardInput(
+                    (int) Event_Message,
+                    (unsigned long) Event_LongVK,
+                    (unsigned long) Event_LongScanCode );
+
+        return (int) Status;
+    }
+
+// ===================================
+// Not a combination
+// Send break and make keys to the window server.
+// Not a combination key, so return 
+// without calling the local procedure.
+// It returns
+// 3. Plain keydown → send outward to valid targets
+
+    //if ( alt_status != TRUE && ctrl_status != TRUE && shift_status != TRUE )
+    if  (isCombination != TRUE)
+    {
+
+        // Send it to the tty associated with stdin.
+        // Only the foreground thread can read this.
+        if (InputTargets.target_stdin == TRUE)
+        {
+            if (Event_Message == MSG_KEYDOWN){
+                wbytes = (int) ibroker_send_ascii_to_stdin((int) __int_ASCII);
+            }
+        }
+
+       // ds thread queue
+        if (InputTargets.target_thread_queue == TRUE)
+        {
+
+            // Let's send only the function keys to the display server,
+            // not the other ones. In order to be used by the window manager.
+            // Make and Break.
+
+            if (Event_Message == MSG_SYSKEYDOWN || Event_Message == MSG_SYSKEYUP)
+            {
+                // F11
+                // Intercepted by Broker.
+                // Converted into a fullscreen toggle event.
+                // Sent directly to the Display Server.
+                // Not delivered to apps.
+                if (Event_LongVK == VK_F11)
+                {
+                    ibroker_post_message_to_ds(
+                        Event_Message, 
+                        Event_LongVK,
+                        Event_LongScanCode );
+                    return 0;
+                }
+
+                // F1–F10, F12
+                // Delivered to the foreground app.
+                switch (Event_LongVK){
+                    case VK_F1: 
+                    case VK_F2: 
+                    case VK_F3: 
+                    case VK_F4:
+                    case VK_F5: 
+                    case VK_F6: 
+                    case VK_F7: 
+                    case VK_F8:
+                    case VK_F9: 
+                    case VK_F10: 
+                    case VK_F12:
+                        // Send it to the gui-app if the foreground thread 
+                        // associated with it is valid.
+                        if ( foreground_thread > 0 && foreground_thread < THREAD_COUNT_MAX )
+                        {
+                            ipc_post_message_to_tid(
+                                (tid_t) __HARDWARE_TID, 
+                                (tid_t) foreground_thread,
+                                Event_Message, 
+                                Event_LongVK, 
+                                Event_LongScanCode );
+                            return 0;
+                        }
+                        break;
+                    return 0;
+                };
+
+                return 0;
+            }
+
+            // ds queue:: 
+            // regular keys, not combinations.
+    
+            // #test
+            // NOT SENDING typing chars to the display server for now.
+            // Thais is why the ds is not printing the typed chars
+            // in the editbox anymore.
+
+            // #test:
+            // Reativating this.
+            // Sending typed keys to the display server.
+            // Remember: We are also sending it to other apps via stdin.
+            // #todo: Maybe the display server needs to ignore these keys sometimes.
+                
+            // #bugbug
+            // What are the types we're sending here
+            // Existing behavior: send to display server
+
+            // #debug
+            //printk("vk=%d sc=%d\n",Event_LongVK,Event_LongScanCode);
+
+            // Special tratment for tab key
+            if (Event_LongVK == VK_TAB)
+            {
+                int ItWantsTAB = FALSE;
+                ItWantsTAB = 
+                    (int) ibroker_app_wants_event( 
+                        foreground_thread, MSG_KEYDOWN, VK_TAB );
+                if (ItWantsTAB == TRUE)
+                {
+                    // TARGET: GUI APP
+                    ibroker_post_message_to_fg_thread(
+                        Event_Message, 
+                        Event_LongVK, 
+                        Event_LongScanCode );
+                
+                    // Return in the case of TAB events.
+                    // This way we do not send it to the server too.
+                    return 0;
+                }
+
+                // TARGET: DS
+                ibroker_post_message_to_ds(
+                    Event_Message, Event_LongVK, Event_LongScanCode );
+                return 0;
+            }
+
+            // #test
+            // 0x1B is the scancode for the ESCAPE key for now, not VK_SCAPE.
+            // if (Event_LongVK == 0x1B || Event_LongVK == VK_ESCAPE)
+            if (Event_LongVK == 0x1B)
+            {
+                printk("ibroker: Testing 0x1B \n");
+
+                int ItWantsEsc = FALSE;
+                ItWantsEsc = 
+                    (int) ibroker_app_wants_event( 
+                        foreground_thread, MSG_KEYDOWN, VK_ESCAPE );
+
+                if (ItWantsEsc == TRUE)
+                {
+                    // TARGET: GUI APP
+                    ibroker_post_message_to_fg_thread(
+                        Event_Message, 
+                        VK_ESCAPE,  //Event_LongVK, 
+                        Event_LongScanCode );
+                }
+
+                return 0;
+            }
+
+            // For the other events we're still sending for both, app and server.
+
+            // TARGET: GUI APP
+            ibroker_post_message_to_fg_thread(
+                Event_Message, 
+                Event_LongVK, 
+                Event_LongScanCode );
+
+            // TARGET: DS
+            ibroker_post_message_to_ds(
+                Event_Message, Event_LongVK, Event_LongScanCode );
+        }
+
+        // Returns when its not a combination
+        return 0;
+    } // END: NOT COMBINATION
+
+fail:
+    return (int) -1;
+}
+
+// ----------------------------------------------
+// wmMouseEvent:
+// This is basically the low level support for the
+// ps2 mouse on Gramado OS.
+// We are called from the embedded ps2 mouse device driver.
+// :: We are called, we do not read data from a file provided
+// by the device driver.
+// We post the message into the stdin file and into the
+// control thread of the widnow server and sometimes
+// we process the input before sending a message.
+// ----------------------------------------------
+// For mouse events, see: window.h
+// #todo: change parameters.
+// we need more information about the mouse event.
+// called by __ps2mouse_parse_data_packet in ps2mouse.c
+//  Post mouse events only to the window server's control thread.
+// #todo
+// Se uma tecla de controle estiver precionada,
+// então podemos enviar o status das teclads de controle
+// atraves do segundo long.
+
+// Called by __ps2mouse_parse_data_packet() in ps2mouse.c.
+// Right after the ps2 mouse interrupt handler.
+int 
+wmMouseEvent(
+    int event_id,
+    long long1, 
+    long long2 )
+{
+    int Status = -1;
+    //static long old_x=0;
+    //static long old_y=0;
+
+// data:
+    unsigned long button_number = 
+        (unsigned long) (long1 & 0xFFFF);
+    //unsigned long ? = long2;
+
+    unsigned long deviceWidth = (unsigned long) screenGetWidth();
+    unsigned long deviceHeight = (unsigned long) screenGetHeight();
+    deviceWidth  = (unsigned long) (deviceWidth & 0xFFFF);
+    deviceHeight = (unsigned long) (deviceHeight & 0xFFFF);
+    if (deviceWidth==0 || deviceHeight==0){
+        panic("wmMouseEvent: w h\n");
+    }
+
+// No mouse device can send us input event yet.
+    if (system_state != SYSTEM_RUNNING)
+        goto fail;
+
+
+// Parameters:
+    if (event_id < 0){
+        goto fail;
+    }
+
+// ====================================
+// mouse move events:
+
+    int use_kernelside_mouse_drawing = FALSE;
+    use_kernelside_mouse_drawing = 
+        (int) ibroker_get_kernelside_mouse_drawing_status();
+
+    //#debug
+    //printk ("w:%d h:%d\n",deviceWidth, deviceHeight);
+    //printk ("x:%d y:%d\n",long1, long2);
+    //refresh_screen();
+    //while(1){}
+
+// #test
+// Draw rectangle.
+// #todo #bugbug
+// Isso está falhando ...
+// Existe algum problema na rotina de retângulo
+// que gera PF. Provavelmente é alguma coisa na
+// tipagem de algumas variáveis ... pois esse
+// é um código portado da arquitetura de 32bit 
+// para a arquitetura de 64bit.
+// IN: window pointer, event id, x, y.
+
+    // The relative values
+    unsigned long rel_long1 = 0;
+    unsigned long rel_long2 = 0;
+
+    if (event_id == MSG_MOUSEMOVE)
+    {
+        // Limits
+        if (long1 < 1){ long1=1; }
+        if (long2 < 1){ long2=1; }
+        if (long1 >= deviceWidth) { long1 = (deviceWidth-1);  }
+        if (long2 >= deviceHeight){ long2 = (deviceHeight-1); }
+
+        mouse_x = (unsigned long) long1;
+        mouse_y = (unsigned long) long2;
+
+        // #test
+        // Displaying the mouse pointer using 
+        // kernel-side drawing routines.
+        // see: bldisp.c
+        if (use_kernelside_mouse_drawing == TRUE)
+        {
+            bldisp_update_mouse_position(long1, long2);
+            bldisp_display_mouse_cursor();
+
+            // Hit-testing
+            // #todo:
+            // It tells us what is the wproxy window the mouse is onto.
+            // The thread associated with this wproxy window receives 
+            // the message.
+            wproxy_hit_test00(long1, long2);
+
+            // #test
+            // Sending mouse move to the app
+            //ibroker_post_message_to_fg_thread(
+                //event_id, (unsigned long) long1, (unsigned long) long2 );
+
+            // Client area hit → send to the app (relative coordinates).
+            // Non‑client area hit → send to the server (absolute coordinates).
+
+            // #test
+            // Send it to the target app
+            if (wproxy_hover != NULL)
+            {
+                if (wproxy_hover->magic == 1234)
+                {
+                    // Inside the frame, send absolute values.
+                    if (wproxy_hover->hit_area == HIT_FRAME){
+
+                        //printk("frame\n");
+                        ibroker_post_message_to_ds(
+                            event_id, 
+                            (unsigned long) long1, 
+                            (unsigned long) long2 );
+                        return 0;
+
+                    // Inside the client area, send relative values.
+                    } else if (wproxy_hover->hit_area == HIT_CLIENT) {
+
+                        // Good for regular apps
+                        // For regular app windows, the correct relative calculation is this.
+                        rel_long1 = long1 - (wproxy_hover->l + wproxy_hover->ca_l);
+                        rel_long2 = long2 - (wproxy_hover->t + wproxy_hover->ca_t);
+
+                        // #hack
+                        if (wproxy_hover == wproxy_shell)
+                        {
+                            // Good for taskbar
+                            rel_long1 = long1 - wproxy_hover->ca_l;
+                            rel_long2 = long2 - wproxy_hover->ca_t;
+                        }
+
+                        //printk("client\n");
+                        ipc_post_message_to_tid(
+                            (tid_t) __HARDWARE_TID, 
+                            (tid_t) wproxy_hover->tid,
+                            event_id, 
+                            (unsigned long) rel_long1, 
+                            (unsigned long) rel_long2 );
+                        return 0;
+
+                    } else {
+                        // Abort?
+                        return 0;
+                    };
+                }
+            }
+
+            return 0;
+        }
+
+        // #test
+        // No caso de MSG_MOUSEMOVE, podemos checar se
+        // a última mensagem na fila é também um MSG_MOUSEMOVE.
+        // Nesse caso podemos apenas alterar os valores 
+        // na mensagem ja postada, ao invés de postar uma nova.
+        // O window server ficaria apenas com a posição atual.
+
+        if (use_kernelside_mouse_drawing != TRUE){
+            ibroker_post_message_to_ds(
+                event_id, (unsigned long) long1, (unsigned long) long2 );
+        }
+
+        // #test
+        // Sending mouse move to the app
+        //ibroker_post_message_to_fg_thread(
+            //event_id, (unsigned long) long1, (unsigned long) long2 );
+
+        // #test
+        // Improve the performance of the display server.
+
+        //printk("Move %d %d\n", long1, long2);
+
+        return 0;
+    }
+
+// ====================================
+// Button events:
+// Buttons:
+// Pressionado ou liberado.
+// Post message.
+// #todo
+// Se uma tecla de controle estiver precionada,
+// então podemos enviar o status das teclads de controle
+// atraves do segundo long.
+// IN: window pointer, event id, button number. button number.
+// #todo: Send control keys status.
+    if ( event_id == MSG_MOUSEPRESSED || 
+         event_id == MSG_MOUSERELEASED )
+    {
+        if (use_kernelside_mouse_drawing == TRUE)
+        {
+
+            //if (event_id == MSG_MOUSERELEASED)
+            //{
+                // #test: Create a window and draw it into the front buffer.
+                // wproxy_test0(mouse_x, mouse_y);
+                // wproxy_test2(mouse_x, mouse_y);
+
+                /*
+                // #test: Send mouse button events to the foreground thread.
+                // TARGET: GUI APP
+                // Sending it to the fg thread. Actually we gotta 
+                // send it to the thread associated
+                // with the window that is under the mouse pointer.
+                ibroker_post_message_to_fg_thread(
+                    event_id, // Event_Message, 
+                    button_number, // Event_LongVK, 
+                    button_number // Event_LongScanCode 
+                );
+                */
+
+                // #test
+                // Send it to the target app
+                if (wproxy_hover != NULL)
+                {
+                    if (wproxy_hover->magic == 1234)
+                    {
+                        // Inside the frame, send message to the server.
+                        if (wproxy_hover->hit_area == HIT_FRAME)
+                        {
+                            ibroker_post_message_to_ds( 
+                                event_id, 
+                                button_number, 
+                                button_number );
+                            return 0;
+                        }
+
+                        // Inside the client area, send message to the app.
+                        if (wproxy_hover->hit_area == HIT_CLIENT)
+                        {
+
+                            //printk("send mouse release %d\n",wproxy_hover->tid);
+                            ipc_post_message_to_tid(
+                                (tid_t) __HARDWARE_TID, 
+                                (tid_t) wproxy_hover->tid,
+                                event_id, 
+                                (unsigned long) button_number, 
+                                (unsigned long) button_number );
+                        
+                            return 0;
+                        }
+                    }
+                }
+            //}
+
+            return 0;
+        }
+
+        //ibroker_post_message_to_ds( event_id, button_number, button_number );
+        return 0;
+    }
+
+done:
+    return 0;
+fail:
+    return (int) -1;
+}
+
+// It goes directly to the display server.
+// It's not processed by the kernel.
+int wmKeyboardEvent(int event_id, long long1, long long2)
+{
+
+// Nobody can send us keyboard input event yet.
+    if (system_state != SYSTEM_RUNNING)
+        goto fail;
+
+// Parameters:
+    if (event_id < 0)
+        goto fail;
+
+// #todo:
+// What are the valid events?
+// Use switch()
+
+    ibroker_post_message_to_ds(
+            event_id, 
+            (unsigned long) long1, 
+            (unsigned long) long2 );
+
+    return 0;
+fail:
+    return (int) -1;
+}
+
+// Called by DeviceInterface_PIT() in pit.c.
+// Right after the the timer interrupt handler.
+int wmTimerEvent(int signature)
+{
+
+// Timers can't send us timer events yet.
+    if (system_state != SYSTEM_RUNNING)
+        goto fail;
+
+// Parameters:
+    if (signature != 1234){
+        goto fail;
+    }
+
+// #test
+// Master timer.
+// After 1 Sec.
+    if ((jiffies % JIFFY_FREQ) == 0){
+        ibroker_post_message_to_ds( MSG_TIMER, 1234, jiffies );
+    }
+
+    //return 0;
+
+/*
+//#test
+// Polling ps2
+    if ( (jiffies % (16)) == 0 )
+    {
+        PS2Keyboard.use_polling=TRUE;
+        PS2Keyboard.irq_is_working=FALSE;
+        ps2kbd_poll();
+
+        PS2Mouse.use_polling=TRUE;
+        PS2Mouse.irq_is_working=FALSE;
+        ps2mouse_poll();
+    }
+*/
+
+/*
+//--------------------
+// It is time to flush the dirty rectangles
+// in the window server.
+// 1000/16*4 = 15,625 fps.
+// #test 60fps com o pit a 1000.
+// 1000/16*1 = 62.5
+// 1000/16*2 = 31,25
+// 1000/16*3 = 20,83
+// 1000/16*4 = 15,625
+// ::: Reset callback stuff.
+// Reconfigura os dados sobre o callback.
+// #todo: Podemos ter uma estrutura para eles.
+// Acho que o assembly importa esses valores,
+// e é mais difícil importar de estruturas.
+
+    if (CallbackEventInfo.initialized != TRUE)
+        return 0;
+
+    if (CallbackEventInfo.initialized == TRUE)
+    {
+        // reinitialize callback based on the saved value.
+        if ( CallbackEventInfo.r3_procedure_address != 0 )
+        {
+            setup_callback(CallbackEventInfo.r3_procedure_address);
+        }
+    }
+//--------------------
+*/
+    return 0;
+
+fail:
+    return (int) -1;
+}
+
+int ibroker_initialize(int phase)
+{
+    if (phase == 0){
+        InputBrokerInfo.shell_flag = FALSE;
+        InputBrokerInfo.initialized = TRUE;
+    } else if (phase == 1){
+
+        printk("Setup keymaps\n");
+
+        // Setup the keymaps
+        ibroker_set_keymap(
+            (unsigned char *) map_abnt2,       // Normal
+            (unsigned char *) shift_abnt2,     // Shift
+            (unsigned char *) ctl_abnt2,       // Control
+            NULL,                              // Altgr
+            (unsigned char *) extended_abnt2   // Extended
+        );
+
+        //panic ("breakpoint");
+    };
+
+
+// #test
+// Mouse support
+// Set flag
+    //ibroker_use_kernelside_mouse_drawing(TRUE);
+    ibroker_use_kernelside_mouse_drawing(FALSE);
+
+    // ...
+
+    return 0;
+}
+

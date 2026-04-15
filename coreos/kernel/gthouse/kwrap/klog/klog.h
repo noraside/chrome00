@@ -1,0 +1,30 @@
+// klog.h
+// Created by Fred Nora.
+
+#ifndef __KLOG_KLOG_H 
+#define __KLOG_KLOG_H    1
+
+// Serial debug support.
+int is_using_serial_debug(void);
+void enable_serial_debug(void);
+void disable_serial_debug(void);
+
+//
+// Verbose via serial.
+//
+
+void debug_print (const char *data);
+void PROGRESS (const char *string);
+
+// Send a formated string to the serial port.
+int serial_printk(const char *fmt, ...);
+
+int debug(void);
+void debug_breakpoint (void);
+unsigned long 
+debug_compute_checksum ( 
+    unsigned char *buffer, 
+    unsigned long lenght );
+
+#endif    
+

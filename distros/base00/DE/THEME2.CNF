@@ -1,0 +1,33 @@
+
+box Theme2
+[
+    // Comment single line
+
+    /*
+        Comment 
+        Multiple
+        Lines
+    */
+
+    meta meta00()
+    {
+        name("meta00");
+        content("2");
+        return 1 + 2;
+    }
+
+    meta meta01()
+    {
+        name("meta01");
+        content("ffff");
+        return 1 + 4;
+    }
+
+    meta metareturn() 
+    {
+        name("metareturn");
+        content("default-content");
+        return 1000*8;
+    }
+] 
+

@@ -1,0 +1,283 @@
+// config.h
+// Config for the Gramado kernel only. Not the whole system.
+// #ps: Do not change anything if you don't know what your are doing.
+// Created by Fred Nora.
+
+#ifndef ____KERNEL_CONFIG_H
+#define ____KERNEL_CONFIG_H    1
+
+// #bugbug #important
+// #todo: We really need to fix up this limits.
+// Current critical sizes:
+// kernel = 423KB
+// ds00   = 225KB
+// see: distros/base00/DE/
+// -------------
+// see: 
+//  + intake/te.c
+//  + fs/fsload.c  
+#define CONFIG_IMAGESIZE_LIMIT_IN_KB  408  // 400+
+// ...
+
+
+// See: head_64.asm, x64.c and tss.h
+//#define CONFIG_RING0_STACK_SIZE_IN_KB    8
+
+// See: clone.c process.c and process.h
+#define CONFIG_RING3_STACK_SIZE_IN_KB    64  //32
+
+// ------------------------------------------------------
+// Target machine
+// #todo: Explain it better.
+#define __TARGET_MACHINE_BAREMETAL     0
+#define __TARGET_MACHINE_QEMU          1
+#define __TARGET_MACHINE_VIRTUALBOX    2
+// ...
+#define CONFIG_TARGET_MACHINE  __TARGET_MACHINE_BAREMETAL 
+// ...
+
+// Use headless mode.
+#define CONFIG_HEADLESS_MODE  0
+
+// #test
+// It changes the whey printk will work. Sending bytes to the serial port.
+// This is case only for the initialization process.
+// #bugbug: 
+// It also supress the use of printk after the initialization.
+// So, we can't see the output for the kernel console.
+#define CONFIG_PRINTK_TO_SERIAL  1
+
+// #test
+// It changes the whey printk will work. Sending bytes to the serial port.
+// This is case only for syscalls.
+#define CONFIG_PRINTK_TO_SERIAL_DURING_SYSCALLS  1
+
+// Progress bar during the kernel initialization.
+#define CONFIG_USE_PROGRESSBAR  0
+
+// ------------------------------------------------------
+// Device flags:
+
+// Sending verbose to serial port
+#define USE_SERIALDEBUG    0
+
+// Enable the initialization of e1000 controller.
+// This is used to test the network infrastructure.
+// #important
+// Use 'legacy' acceleration on Virtualbox, NOT the Hyper-v acceleration.
+// That was the reason for the issues in DHCP dialog.
+// #todo: See 'Core isolation' in network/firewall configuration.
+// >> It works only on Virtualbox using PIIX3 chipset. <<
+// see: pci.c, e1000hw.c
+#define USE_E1000    0
+
+
+// #test: Pooling PS2 Keyboard and Mouse.
+// Use pooling instead of interrupts for ps2 devices.
+// Good for real machines that lacks interrupts in long mode,
+// with ps2 keyboard and mouse.
+// #bugbug: 
+// >>>>  This is a test yet. <<<<
+// >>>>  It may not work! Be careful! <<<<
+
+#define CONFIG_USE_POOLING_FOR_PS2_KEYBOARD  0
+#define CONFIG_USE_POOLING_FOR_PS2_MOUSE  0
+
+
+
+// Select the default desired input targets
+// It sends the same input to multiple targets,
+// depends on the configurarion.
+// See: 
+// kmain.c   (When we setup the configuration options)
+// ibroker.c (Send input to the targets)
+#define CONFIG_INPUT_TARGET_TTY  0       // #todo: This is work in progress
+#define CONFIG_INPUT_TARGET_STDIN  1     // # working
+#define CONFIG_INPUT_TARGET_THREAD_QUEUE  1  // # working
+// More? Maybe initprocess is an configuration option.
+// ...
+
+
+// ------------------------------------------------------
+// lapic/ioapic debug.
+// see: kmain.c, apic.c, ioapic.c.
+#define USE_SMP    1
+// #test
+// This is a test yet.
+// >> It works only on Virtualbox using ICH9 chipset. <<
+// # set to 1 to test it.
+#define CONFIG_INITIALIZE_SECOND_PROCESSOR  0
+#define ENABLE_APIC    0  // Enable apic and timer
+#define ENABLE_IOAPIC  0
+// ...
+
+// ------------------------------------------------------
+
+// IDE Interface:
+// Primary Master Drive.
+// Primary Slave Drive.
+// Secondary Master Drive.
+// Secondary Slave Drive.
+
+// Serial IDE
+// Primary Master,   also called SATA1.
+// Primary Slave,    also called SATA2.
+// Secondary Master, also called SATA3.
+// Secondary Slave,  also called SATA4.
+
+#define __BAR0  0  // 0x1F0
+#define __BAR1  1  // 0x3F6
+#define __BAR2  2  // 0x170
+#define __BAR3  3  // 0x376
+
+// See: 
+// Saved by __ata_initialize() in ata.c
+#define __CONFIG_DEFAULT_ATA_PORT    __BAR0   // Primary   (Channel 0)
+//#define __CONFIG_DEFAULT_ATA_PORT    __BAR1   // 
+//#define __CONFIG_DEFAULT_ATA_PORT    __BAR2   // 
+//#define __CONFIG_DEFAULT_ATA_PORT    __BAR3   // 
+
+// ------------------------------------------------------
+// virtualbox Info:
+// PIIX3 ATA: LUN#0: disk, PCHS=963/4/17, total number of sectors 65536
+// #define VHD_32MB_CHS { 963, 4, 17 }  
+// ------------------------------------------------------
+
+// #bugbug
+// Ouve uma falha..
+// Só temos o registro das portas 0 e 2.
+// A porta 0 equivale ao canal primary.
+// A porta 2 equivale ao canal secondary.
+// Eram para as portas 0 e 1 representarem o canal primary.
+// Eram para as portas 2 e 3 represerntarem o canal secondary.
+
+// #importante:
+// Na verdade só funcionam as portas 0 e 2 porque são 
+// selecionadores das BARs 0 e 2, onde estão as portas de HD.
+// #todo: rever o código nessa parte de configuração das BARs.
+
+// A questão é que existem canais extras.
+// Vamos presizar ler mais BARs?
+
+/*
+Current disk controller chips almost always support two ATA buses per chip. 
+There is a standardized set of IO ports to control the disks on the buses. 
+The first two buses are called the Primary and Secondary ATA bus, and are almost 
+always controlled by IO ports 0x1F0 through 0x1F7, and 0x170 through 0x177, 
+respectively (unless you change it). The associated 
+Device Control Registers/Alternate Status ports are IO ports 0x3F6, and 0x376,
+respectively. The standard IRQ for the Primary bus is IRQ14, and IRQ15 for the Secondary bus.
+
+If the next two buses exist, they are normally controlled by IO ports 0x1E8 through 0x1EF, 
+and 0x168 through 0x16F, respectively. The associated
+Device Control Registers/Alternate Status ports are IO ports 0x3E6, and 0x366. 
+*/
+
+/*
+This is the multiple IDE interface driver, as evolved from hd.c.
+It supports up to 9 IDE interfaces per default, on one or 
+more IRQs (usually 14 & 15). 
+There can be up to two drives per interface, as per the ATA-6 spec.
+Primary:    ide0, port 0x1f0; major=3;  hda is minor=0; hdb is minor=64
+Secondary:  ide1, port 0x170; major=22; hdc is minor=0; hdd is minor=64
+Tertiary:   ide2, port 0x1e8; major=33; hde is minor=0; hdf is minor=64
+Quaternary: ide3, port 0x168; major=34; hdg is minor=0; hdh is minor=64
+fifth..     ide4, usually PCI, probed
+sixth..     ide5, usually PCI, probed
+*/
+
+// ------------------------------------------------------
+// PIT configuration:
+
+#define DEFAULT_JIFFY_FREQ    1000
+
+
+// ...
+
+
+/*
+Standard Linux Runlevels (0-6)
+0 (Halt): Shuts down the system.
+1 (Single-User Mode): Minimal services, for maintenance or recovery.
+2 (Multi-User, No Network): Multi-user mode, but without network services.
+3 (Full Multi-User): Standard command-line interface (CLI) mode with networking.
+4 (Custom): Unused by default, can be defined by the user.
+5 (Graphical): Similar to runlevel 3 but with a graphical user interface (GUI).
+6 (Reboot): Reboots the system.
+*/
+
+#define __RUNLEVEL_HALT  0
+#define __RUNLEVEL_SINGLE_USER  1
+#define __RUNLEVEL_MULTI_USER  2
+#define __RUNLEVEL_FULL_MULT_USER  3
+#define __RUNLEVEL_CUSTOM  4
+#define __RUNLEVEL_GRAPHICAL  5
+#define __RUNLEVEL_REBOOT  6
+
+#define CONFIG_CURRENT_RUNLEVEL  __RUNLEVEL_MULTI_USER
+
+// ==================================================
+// ## breack points ##
+// Set up what what is the breakpoint.
+
+// Seriam inicializações parciais programadas. 
+
+//#todo
+//Criar um breakpoint apo's a sondagem de dispositivos pci.
+
+//#define BREAKPOINT_TARGET_AFTER_VIDEO 1
+//#define BREAKPOINT_TARGET_AFTER_SYSTEM 1
+//#define BREAKPOINT_TARGET_AFTER_RUNTIME 1
+//#define BREAKPOINT_TARGET_AFTER_INIT 1
+//#define BREAKPOINT_TARGET_AFTER_LOGON 1
+//#define BREAKPOINT_TARGET_AFTER_LOGOFF 1
+//#define BREAKPOINT_TARGET_AFTER_HAL 1
+//#define BREAKPOINT_TARGET_AFTER_MK 1
+//#define BREAKPOINT_TARGET_AFTER_ENTRY 1
+
+//
+// ## targets ##
+//
+
+// Também pretendo fazer a inicialização mudar de 
+// direção dependendo do alvo programado.
+
+// Isso inicializa os três aplicativos do gramado core.
+//#define TARGET_GRAMADOCORE_APPS 1
+
+// Isso inicializa apenas o app init do gramado core.
+//#define TARGET_GRAMADOCORE_INIT 1
+
+// See: fonts.h
+// #bugbug: FONT8X8 is define bellow this definition.
+//#define DEFAULT_FONT_SIZE  FONT8X8
+//#define DEFAULT_FONT_SIZE FONT8X16
+//...
+
+// ------------------------------------------------------
+// The quantum multiplier.
+// See: quantum.h
+
+// ++ More responsive
+#define __QUANTUM_MULTIPLIER    1
+//#define __QUANTUM_MULTIPLIER    2
+//#define __QUANTUM_MULTIPLIER    3
+//#define __QUANTUM_MULTIPLIER    9
+// ...
+// -- Less responsive
+
+#define CONFIG_QUANTUM_MULTIPLIER  __QUANTUM_MULTIPLIER  
+
+/*
+ * Scheduling policies
+ */
+
+#define __SCHED_POLICY_RR    0
+#define __SCHED_POLICY_PRIORITY_INTERLEAVING  1  // Queues
+// ...
+#define CONFIG_CURRENT_SCHEDULING_POLICY  \
+    __SCHED_POLICY_RR
+
+#endif 
+
+
